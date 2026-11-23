@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: Comma-separated known targets (radar_puffin or radar_puffin,biscuit)
+        description: Comma-separated known targets (for example radar_puffin or radar_puffin,biscuit)
         required: true
         default: radar_puffin
         type: string
@@ -1143,10 +1143,12 @@ jobs:
         run: |
           set -euo pipefail
           compiler_sha="$(sha256sum "$RUNNER_TEMP/armhf-root/usr/bin/arm-linux-gnueabihf-gcc-13" | awk '{print $1}')"
-          printf 'kernel_key=libreecho-kernel-out-v2-parity-radar_puffin-biscuit-%s-%s-%s-%s\n' \
+          eval "$(python3 build/ci/validate-targets.py --targets radar_puffin --shell)"  # canonical default target
+          printf 'kernel_key=libreecho-kernel-out-v2-parity-%s-%s-%s-%s-%s\n' \
+            "${{ inputs.targets || 'radar_puffin' }}" \
             "${{ needs.resolve-and-preflight.outputs.linux_sha }}" \
             "$compiler_sha" \
-            "$(sha256sum sources/linux/arch/arm/configs/mt8163_arm32_defconfig | awk '{print $1}')" \
+            "$(sha256sum "sources/linux/arch/$KERNEL_ARCH/configs/$KERNEL_DEFCONFIG" | awk '{print $1}')" \
             "${{ needs.prepare-public-inputs.outputs.armhf_root_digest }}-${{ hashFiles('release/targets/*.json') }}" \
             >> "$GITHUB_OUTPUT"
       - name: Restore kernel object cache
