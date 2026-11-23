@@ -268,6 +268,68 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "target_id": {
+            "const": "lidar"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "soc": {
+            "const": "mt8167"
+          },
+          "arch": {
+            "const": "arm64"
+          },
+          "layout_profiles": {
+            "const": [
+              "kaeru"
+            ]
+          },
+          "release_slug": {
+            "const": "lidar"
+          },
+          "display_name": {
+            "const": "Amazon Echo Plus (2nd Gen)"
+          },
+          "fastboot_products": {
+            "const": [
+              "LIDAR"
+            ]
+          },
+          "kernel": {
+            "type": "object",
+            "properties": {
+              "defconfig": {
+                "const": "mt8167_arm64_defconfig"
+              },
+              "dtb": {
+                "const": "libreecho-lidar.dtb"
+              }
+            }
+          },
+          "platform": {
+            "type": "object",
+            "properties": {
+              "tools_profile": {
+                "const": "mt8167-arm64"
+              },
+              "dtb_verifier": {
+                "const": "lidar"
+              },
+              "hw_profile": {
+                "const": "lidar@1"
+              }
+            }
+          }
+        }
+      }
     }
   ]
 }

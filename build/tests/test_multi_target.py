@@ -170,6 +170,19 @@ class DescriptorTests(unittest.TestCase):
             self.assertEqual(asset_prefix(tag), 'libreecho-' + tag)
             self.assertEqual(asset_prefix(tag, 'biscuit'), 'libreecho-biscuit-' + tag.removeprefix('radar-puffin-'))
 
+    def test_asset_prefix_covers_every_target(self):
+        tag = 'radar-puffin-v0.14.0'
+        prefixes = {target: asset_prefix(tag, target) for target in KNOWN_TARGETS}
+        self.assertIn('libreecho-lidar-v0.14.0', prefixes.values())
+        self.assertEqual(len(set(prefixes.values())), len(KNOWN_TARGETS))
+        for target, prefix in prefixes.items():
+            # The installer ships alone and repeats the naming rule; drift here
+            # would make it fetch assets the release never published.
+            self.assertEqual(INSTALLER.target_asset_prefix(tag, target), prefix)
+        for bad in ('v0.14.0', 'radar-puffin-latest', 'radar-puffin-v0.14'):
+            with self.subTest(tag=bad), self.assertRaises(ValueError):
+                asset_prefix(bad, 'lidar')
+
     def test_platform_feature_detection_and_radar_only_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             tool = Path(tmp) / 'old.py'
@@ -179,6 +192,61 @@ class DescriptorTests(unittest.TestCase):
             tool.write_text("print('usage: --target ID --target-descriptor-sha256 HASH')\n")
             for target in KNOWN_TARGETS:
                 self.assertEqual(platform_target_args(tool, target, descriptor_sha256(target)), ['--target', target, '--target-descriptor-sha256', descriptor_sha256(target)])
+
+    def test_lidar_descriptor_and_soc_flow(self):
+        data = load_target('lidar')
+        self.assertEqual((data['soc'], data['arch'], data['layout_profiles']), ('mt8167', 'arm64', ['kaeru']))
+        self.assertEqual((data['kernel']['defconfig'], data['kernel']['dtb']),
+                         ('mt8167_arm64_defconfig', 'libreecho-lidar.dtb'))
+        self.assertIs(data['hardware_accepted'], False)
+        self.assertEqual(accepted_targets(), PARITY_TARGETS)
+        self.assertNotIn('lidar', INSTALLER_TARGETS)
+        # A cross-SoC descriptor is rejected in either direction.
+        for target, soc in (('radar_puffin', 'mt8167'), ('lidar', 'mt8163')):
+            changed = load_target(target); changed['soc'] = soc
+            with self.subTest(target=target, soc=soc), self.assertRaises(ValueError):
+                validate_descriptor(changed, target)
+        with self.assertRaises(ValueError):
+            validate_descriptor({**load_target('lidar'), 'arch': 'arm32'}, 'lidar')
+
+    def test_lidar_ota_identity_uses_descriptor_soc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            boot = root / 'boot.img'
+            boot.write_bytes(b'ANDROID!' + b'\x00' * (16 * 1024 * 1024 - 8))
+            signing = SigningKey.generate()
+            (root / 'public.hex').write_text(signing.verify_key.encode().hex() + '\n')
+            boot_sha = sha(boot)
+
+            def bundle(soc):
+                raw = ('format=libreecho-ota-v1\nmanifest_version=1\nboard=lidar\nsoc=' + soc +
+                       '\narchitecture=armv7\nimage_profile=ota\nversion=fixture-v1\n'
+                       'service_profile=production\nfeature_policy=community-noncommercial\n'
+                       'update_channel=dev\nboot_filename=boot.img\nboot_size=16777216\n'
+                       'boot_sha256=' + boot_sha + '\n').encode()
+                path = root / (soc + '.ota.tar')
+                with tarfile.open(path, 'w', format=tarfile.USTAR_FORMAT) as archive:
+                    for name, data in (('manifest', raw), ('manifest.sig', signing.sign(raw).signature.hex().encode() + b'\n'),
+                                       ('boot.img', boot.read_bytes())):
+                        record = tarfile.TarInfo(name); record.size = len(data); record.mode = 0o644
+                        archive.addfile(record, io.BytesIO(data))
+                return path
+
+            validate_control_tar(bundle('mt8167'), root / 'public.hex', 'v1', '', expected_target='lidar')
+            with self.assertRaises(ContractError):
+                validate_control_tar(bundle('mt8163'), root / 'public.hex', 'v1', '', expected_target='lidar')
+
+    def test_unaccepted_lidar_cannot_prepare_a_stable_release(self):
+        self.assertFalse(hardware_accepted('lidar'))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = subprocess.run([sys.executable, str(CI / 'prepare-stable-release.py'), '--target', 'lidar',
+                '--artifact-root', str(root / 'artifact'), '--product-root', str(root / 'product'),
+                '--product-commit', 'a' * 40, '--release-version', '0.14.0', '--release-notes', 'notes.md',
+                '--output-dir', str(root / 'out')], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('not hardware-accepted', result.stderr)
+            self.assertFalse((root / 'out').exists())
 
     def test_radar_and_biscuit_descriptor_digests_unchanged(self):
         self.assertEqual(descriptor_sha256('radar_puffin'), 'b9e8c5a78178f697634aa3a705ef52efe9f039a162413e289d3e85df3a5b39ab')
@@ -265,6 +333,8 @@ class DescriptorTests(unittest.TestCase):
         original = route(request, 'release/0.14.0', 'workflow_dispatch')
         for targets in (['radar_puffin'], ['biscuit'], list(PARITY_TARGETS)):
             self.assertEqual(route({**request, 'targets': targets}, 'release/0.14.0', 'workflow_dispatch'), original)
+        with self.assertRaisesRegex(ValueError, 'hardware-accepted'):
+            route({**request, 'targets': ['lidar']}, 'release/0.14.0', 'workflow_dispatch')
         with self.assertRaises(ValueError): route({**request, 'targets': ['biscuit'], 'board': 'radar_puffin'}, 'release/0.14.0', 'workflow_dispatch')
 
 
