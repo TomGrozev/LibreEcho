@@ -137,10 +137,19 @@ USERDATA_SUPPORTED_BYTES = frozenset((USERDATA_BYTES, USERDATA_VARIANT_BYTES))
 # still fails closed before any write.
 USERDATA_RADAR_STOCK_BYTES = (0x747FDE - 0x4D0000 + 1) * 512
 USERDATA_BISCUIT_STOCK_BYTES = (0x74BFDE - 0x4D0000 + 1) * 512
+# Lidar's stock GPT has one userdata partition of 9647071 sectors and no Amonet
+# repartitioning history (Platform tools/mt8167-arm64/libreecho_platform_targets.py:35,
+# tools/mt8167-arm64/install/lidar_install.py:18). Only that geometry is reviewed.
+USERDATA_LIDAR_STOCK_BYTES = 9647071 * 512
 USERDATA_TARGET_BYTES = {
     "radar_puffin": frozenset((USERDATA_RADAR_STOCK_BYTES,)),
     "biscuit": frozenset((USERDATA_BISCUIT_STOCK_BYTES,)),
+    "lidar": frozenset((USERDATA_LIDAR_STOCK_BYTES,)),
 }
+# Targets that must match their reviewed geometry exactly. Radar and Biscuit keep
+# the floor-plus-cap rule below for units with Amonet history; Lidar never had
+# that history, so a size outside its stock GPT is a different (or damaged) layout.
+USERDATA_EXACT_TARGETS = frozenset(("lidar",))
 # Any other userdata size is accepted when it is at least the smallest reviewed
 # layout and within a sane upper bound. The installed image identifies the
 # partition by PARTNAME=userdata plus the LIBREECHO_DATA ext4 label written
@@ -204,7 +213,7 @@ AMONET_HOST_TOOLS = {
                    "sha256": "8912e9926cfc45503ad960866501305a684462b1dd1a44c5d82b1f075d6dd8c1"},
 }
 # Device-side identity used only for verified ADB/TWRP recovery after a brick.
-ADB_DEVICE_PROP = {"radar_puffin": "radar", "biscuit": "biscuit"}
+ADB_DEVICE_PROP = {"radar_puffin": "radar", "biscuit": "biscuit", "lidar": "lidar"}
 # Upstream stage1/lkloader.c and include/stage1/lkloader.h: every expdb sub-partition begins with
 # a header whose magic is LK_MAGIC, whose data size is at +4, whose name is at +8, and whose
 # extended magic is at +48. The chain is LK at offset 0, then Kaeru at round8(512 + LK data).
@@ -550,10 +559,36 @@ def select_fastboot_serial(fastboot_bin: str, requested: str) -> str:
 
 
 # Generated from release/targets/*.json; verified by Product target tests.
+# hw_profile and arch are the canonical descriptor values; OTA manifests carry the
+# userspace architecture (armv7) separately, see _target_ota_plan.
 TARGET_INDEX = {
-    "radar_puffin": {"release_slug": "radar-puffin", "fastboot_products": ["RADAR"]},
-    "biscuit": {"release_slug": "biscuit", "fastboot_products": ["BISCUIT"]},
+    "radar_puffin": {"release_slug": "radar-puffin", "fastboot_products": ["RADAR"],
+                     "soc": "mt8163", "arch": "arm32", "hw_profile": "radar_puffin@1",
+                     "boot_slots": ["boot_a", "boot_b"]},
+    "biscuit": {"release_slug": "biscuit", "fastboot_products": ["BISCUIT"],
+                "soc": "mt8163", "arch": "arm32", "hw_profile": "biscuit@0",
+                "boot_slots": ["boot_a", "boot_b"]},
+    "lidar": {"release_slug": "lidar", "fastboot_products": ["LIDAR"],
+              "soc": "mt8167", "arch": "arm64", "hw_profile": "lidar@1",
+              "boot_slots": ["boot_a", "boot_b"]},
 }
+# How a target's boot chain gets to Kaeru fastboot. "amonet" pins a community
+# fastbrick payload; "already-converted" has no payload and only accepts a unit
+# that already answers as Kaeru fastboot, so no boot-chain byte is ever written.
+TARGET_PIN_RULES = {"radar_puffin": "amonet", "biscuit": "amonet", "lidar": "already-converted"}
+# Readback partition names behind the boot slots. Lidar's Kaeru GPT has no legacy
+# `_x` stores, so only the bare names count; Radar and Biscuit accept both.
+READBACK_NAMES = {
+    "lidar": {"a": ("boot_a",), "b": ("boot_b",)},
+}
+
+
+def _readback_names(target: str | None, slot: str) -> frozenset[str]:
+    pinned = READBACK_NAMES.get(target or "", {}).get(slot)
+    if pinned:
+        return frozenset(pinned)
+    return frozenset({f"boot_{slot}_x", f"boot_{slot}"})
+
 
 def fastboot_getvar(fastboot_bin: str, serial: str, name: str) -> str:
     result = _run_command([fastboot_bin, "-s", serial, "getvar", name], 20, check=False)
@@ -636,6 +671,18 @@ def plan_fastbrick(fastboot_bin: str, serial: str, target: str, amonet_zip: "str
     Returns None for an already-unlocked or already-Kaeru unit, which must never be
     bricked again. Every refusal happens before any device write.
     """
+    if TARGET_PIN_RULES.get(target) == "already-converted":
+        # No Amonet payload exists for this target, so the only safe input is a unit
+        # that already runs Kaeru fastboot. Any other answer (including a stock
+        # refusal) refuses; nothing is written and no boot-chain image is sent.
+        kaeru = identify_kaeru(fastboot_bin, serial)
+        if kaeru is None:
+            raise InstallerError(
+                f"{target} has no Amonet fastbrick payload; the device must already run Kaeru "
+                "fastboot as this product. Nothing was written."
+            )
+        print(f"FASTBOOT STAGE: device already carries Kaeru ({kaeru}); no boot chain is flashed.", flush=True)
+        return None
     # Same strict parse as the web installer's assessIdentity: only a recognised
     # true/false is accepted. An empty or unexpected value refuses before any write.
     unlock_raw = fastboot_getvar(fastboot_bin, serial, "unlock_status").strip().lower()
@@ -1049,6 +1096,13 @@ def _validate_android_sparse_image(path: Path, expected_bytes: int) -> int:
 
 def _validate_userdata_partition_size(size: int, target: str | None = None) -> int:
     """Return the ext4 filesystem size for a reviewed userdata partition size."""
+    if target in USERDATA_EXACT_TARGETS:
+        if size not in USERDATA_TARGET_BYTES[target]:
+            raise InstallerError(
+                f"userdata partition size unsupported for {target}: expected "
+                f"{next(iter(USERDATA_TARGET_BYTES[target]))} bytes, got {size:#x}"
+            )
+        return size - size % 4096
     supported = USERDATA_SUPPORTED_BYTES | USERDATA_TARGET_BYTES.get(target or "", frozenset())
     if size in supported or USERDATA_MIN_BYTES <= size <= USERDATA_MAX_BYTES:
         return size - size % 4096
@@ -1226,11 +1280,11 @@ def _userdata_ext4_features(mke2fs: Path, scratch: Path, timeout: float) -> str:
 def format_userdata_in_fastboot(fastboot_bin: str, serial: str, timeout: float) -> None:
     """Build and flash a compatible sparse ext4 filesystem to userdata."""
     print("FASTBOOT STAGE: validating target product and partition geometry.", flush=True)
-    target = verify_fastboot_product(fastboot_bin, serial)
+    detected = verify_fastboot_product(fastboot_bin, serial)
     partition_size = _fastboot_partition_size(fastboot_bin, serial, "userdata")
     if partition_size is None:
         raise InstallerError("fastboot did not report partition size: userdata")
-    size = _validate_userdata_partition_size(partition_size, target)
+    size = _validate_userdata_partition_size(partition_size, detected)
     print(
         f"FASTBOOT STAGE: formatting only userdata as ext4 ({size} of {partition_size} bytes); "
         "boot, system, persist, and expdb are not being formatted.",
@@ -1276,13 +1330,14 @@ def format_userdata_in_fastboot(fastboot_bin: str, serial: str, timeout: float) 
     print("FASTBOOT STAGE: userdata filesystem format complete.", flush=True)
 
 
-def verify_adb_payload_readback(adb_bin: str, serial: str, slot: str, expected_sha256: str, timeout: float = 60) -> None:
+def verify_adb_payload_readback(adb_bin: str, serial: str, slot: str, expected_sha256: str, timeout: float = 60,
+                                target: str | None = None) -> None:
     if slot not in {"a", "b"}:
         raise InstallerError("invalid readback slot")
     part = "10" if slot == "a" else "11"
     expected_name = f"boot_{slot}_x"
     # Same node on both chains: boot_X_x (legacy Amonet) or boot_X (pinned Kaeru).
-    accepted_names = {expected_name, f"boot_{slot}"}
+    accepted_names = _readback_names(target, slot)
     uevent = _run_command(
         [adb_bin, "-s", serial, "shell", "cat", f"/sys/class/block/mmcblk0p{part}/uevent"],
         timeout,
@@ -1748,7 +1803,8 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     )
     if (manifest["schema"] != SCHEMA or not isinstance(manifest["release"], str)
             or not RELEASE.fullmatch(manifest["release"])
-            or manifest["board"] not in TARGET_INDEX or manifest["soc"] != "mt8163"
+            or manifest["board"] not in TARGET_INDEX
+            or manifest["soc"] != TARGET_INDEX[manifest["board"]]["soc"]
             or manifest["image_profile"] != "ota" or manifest["service_profile"] != "production"):
         raise InstallerError("unsupported install manifest")
     manifest["boot"] = _asset(manifest["boot"], "boot record")
@@ -1767,10 +1823,15 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             if asset["name"] in seen:
                 raise InstallerError("duplicate bundle member in manifest")
             seen.add(asset["name"])
-    amonet = _exact_keys(manifest["amonet"], {"archive", "archive_sha256", "archive_size"}, "amonet record")
-    pin = AMONET_PINS[manifest["board"]]
-    if amonet != {"archive": pin["archive"], "archive_sha256": pin["archive_sha256"], "archive_size": pin["archive_size"]}:
-        raise InstallerError("manifest Amonet record does not match the pinned ZIP for this target")
+    if manifest["board"] in AMONET_PINS:
+        amonet = _exact_keys(manifest["amonet"], {"archive", "archive_sha256", "archive_size"}, "amonet record")
+        pin = AMONET_PINS[manifest["board"]]
+        if amonet != {"archive": pin["archive"], "archive_sha256": pin["archive_sha256"], "archive_size": pin["archive_size"]}:
+            raise InstallerError("manifest Amonet record does not match the pinned ZIP for this target")
+    elif manifest["amonet"] not in ({}, {"archive": "", "archive_sha256": "", "archive_size": 0}):
+        # A target whose chain is already Kaeru (Lidar) has no Amonet payload. Any
+        # archive identity in the bundle is a lie about what will be written.
+        raise InstallerError("manifest Amonet record is not empty for a target with no Amonet payload")
     return manifest
 
 
@@ -1905,15 +1966,35 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _target_ota_plan(target: str, release_tag: str) -> dict[str, Any]:
+    """The immutable v3 control fields for a target.
+
+    architecture is the userspace value every LibreEcho OTA manifest carries
+    (build/ci/ota_v3_product.py:59), not the kernel arch: Lidar runs an arm64
+    kernel with armv7 userspace (release/targets/lidar.json).
+    """
+    index = TARGET_INDEX[target]
+    return {
+        'schema': 'libreecho-product-target-plan-v3', 'format': 'libreecho-ota-v3',
+        'manifest_version': 1, 'board': target, 'soc': index['soc'], 'architecture': 'armv7',
+        'image_profile': 'ota', 'transaction_type': 'system', 'release': release_tag,
+        'service_profile': 'production', 'commit_policy': 'after-slot-confirm',
+        'minimum_updater_schema': 3, 'boot_filename': 'boot.img', 'boot_size': 16777216,
+    }
+
+
 def _target_metadata_assets(release_dir: Path, prefix: str, release_tag: str, plan: dict, inventory: dict) -> set[str]:
     """Standalone host-side v3 closure; distribution has no Product modules."""
     features = ('airplay2', 'tts', 'wakeword', 'stt', 'assistant')
     fields = ('asset', 'size', 'sha256', 'manifest_asset', 'manifest_size', 'manifest_sha256', 'daemon_path', 'daemon_sha256')
     top = ('format', 'manifest_version', 'board', 'soc', 'architecture', 'image_profile', 'transaction_type', 'transaction_id', 'release', 'version', 'update_channel', 'service_profile', 'minimum_updater_schema', 'commit_policy', 'boot_filename', 'boot_size', 'boot_sha256', 'feature_ids')
     expected_keys = set(top) - {'feature_ids'} | {'schema', 'features', 'config_schema'}
-    target = 'biscuit' if prefix.startswith('libreecho-biscuit-') else 'radar_puffin'
+    matches = [t for t, d in TARGET_INDEX.items() if prefix.startswith(f"libreecho-{d['release_slug']}-")]
+    if len(matches) != 1:
+        raise InstallerError('v3 target plan does not match a known asset prefix')
+    target = matches[0]
     slug = TARGET_INDEX[target]['release_slug']
-    fixed = {'schema': 'libreecho-product-target-plan-v3', 'format': 'libreecho-ota-v3', 'manifest_version': 1, 'board': target, 'soc': 'mt8163', 'architecture': 'armv7', 'image_profile': 'ota', 'transaction_type': 'system', 'release': release_tag, 'service_profile': 'production', 'commit_policy': 'after-slot-confirm', 'minimum_updater_schema': 3, 'boot_filename': 'boot.img', 'boot_size': 16777216}
+    fixed = _target_ota_plan(target, release_tag)
     if set(plan) != expected_keys or any(type(plan.get(k)) is not type(v) or plan.get(k) != v for k, v in fixed.items()):
         raise InstallerError('invalid immutable v3 target plan')
     if (not VERSION.fullmatch(str(plan['version'])) or plan['update_channel'] not in ('dev', 'stable')
@@ -2384,7 +2465,7 @@ def one_shot(
         _write_state(state_path, {"phase": "ADB_READY", "release": release_tag, "bundle_sha256": bundle_sha})
         print("PAYLOAD STAGE: verifying boot_a_x and boot_b_x readback.", flush=True)
         for slot in selected:
-            verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout)
+            verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout, target)
         _write_state(state_path, {"phase": "READBACK_VERIFIED", "release": release_tag, "bundle_sha256": bundle_sha})
         print("PAYLOAD STAGE: beginning verified feature payload staging.", flush=True)
         try:
@@ -2467,6 +2548,11 @@ def _verify_fastboot_payload_geometry(fastboot_bin: str, serial: str, target: st
     sizes = {name: _fastboot_partition_size(fastboot_bin, serial, name)
              for name in ("boot_a_x", "boot_b_x", "boot_a", "boot_b")}
     stores_x = (sizes["boot_a_x"], sizes["boot_b_x"])
+    if TARGET_PIN_RULES.get(target) == "already-converted" and stores_x != (None, None):
+        raise InstallerError(
+            f"{target} has no legacy _x boot stores; this unit reports {sizes}, "
+            "so it is not the expected Kaeru GPT. Nothing was written."
+        )
     if stores_x == (BOOT_BYTES, BOOT_BYTES):
         # Legacy redirect chain: boot_a/boot_b must be the larger wrapper, never a store.
         wrappers = (sizes["boot_a"], sizes["boot_b"])
@@ -2689,7 +2775,7 @@ def continue_one_shot(
             serial = select_adb_serial(adb_bin, fastboot)
             collect_adb_diagnostics(adb_bin, serial, min(adb_timeout, 30), "post-userdata repair")
             for slot in selected:
-                verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout)
+                verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout, saved_target)
             _write_state(state_path, {"phase": "READBACK_VERIFIED", "release": release, "bundle_sha256": state["bundle_sha256"], "userdata_formatted": True})
         elif phase in {"AMONET_HANDOFF", "FASTBOOT_READY"}:
             print("FASTBOOT STAGE: waiting for the unlocked fastboot device.", flush=True)
@@ -2719,7 +2805,7 @@ def continue_one_shot(
             _write_state(state_path, {"phase": "ADB_READY", "release": release, "bundle_sha256": state["bundle_sha256"]})
             print("PAYLOAD STAGE: verifying boot_a_x and boot_b_x readback.", flush=True)
             for slot in selected:
-                verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout)
+                verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout, saved_target)
             _write_state(state_path, {"phase": "READBACK_VERIFIED", "release": release, "bundle_sha256": state["bundle_sha256"]})
             print("PAYLOAD STAGE: beginning verified feature payload staging.", flush=True)
         else:
@@ -2741,7 +2827,7 @@ def continue_one_shot(
             )
             # State from an earlier process is not current readback evidence.
             for slot in selected:
-                verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout)
+                verify_adb_payload_readback(adb_bin, serial, slot, manifest["boot"]["sha256"], adb_timeout, saved_target)
             _write_state(state_path, {**state, "phase": phase if staged else "READBACK_VERIFIED",
                                       "device_serial": serial, "slots": slots})
         v3 = load_v3_target(release_sources, release, saved_target)

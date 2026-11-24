@@ -11,12 +11,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT = "radar_puffin"
 KNOWN_TARGETS = (DEFAULT, "biscuit", "lidar")
-# Targets the one-shot installer knows. Held back from KNOWN_TARGETS until the
-# installer gates (AMONET_PINS, USERDATA_TARGET_BYTES, TARGET_INDEX) support
-# them: Lidar, PLAN.md Phase 7 installer item.
-# ponytail: delete this constant and compare against KNOWN_TARGETS once
-# tools/libreecho-install.py supports every registered target.
-INSTALLER_TARGETS = ("radar_puffin", "biscuit")
 # Canonical per-target identity the schema allOf blocks pin: release slug,
 # boot-chain products, hardware profile. Kept next to the registry because the
 # descriptor loader validates itself and cannot read the schema twice.

@@ -594,6 +594,129 @@ FAKE_DEVBIN = {
 MISC_BCB = b"\x00ABB\x01\x7f\x7e"
 
 
+class LidarInstallerGateTests(unittest.TestCase):
+    """Lidar through the existing identity, pin, geometry, state and readback gates."""
+
+    def _fastboot(self, product="LIDAR", kaeru=None, unlock="true", sizes=None, calls=None):
+        sizes = sizes or {}
+
+        def run(argv, timeout, *, check=True):
+            if calls is not None:
+                calls.append(list(argv))
+            if argv[-2:] == ["oem", "kaeru-version"]:
+                if kaeru == "kaeru":
+                    return subprocess.CompletedProcess(argv, 0, "", "(bootloader) kaeru-v2\nOKAY\n")
+                if kaeru == "silent":
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", "FAILED (remote: 'unknown command')\n")
+            if argv[-1] == "product":
+                return subprocess.CompletedProcess(argv, 0, "", f"product: {product}\n")
+            if argv[-1] == "unlock_status":
+                return subprocess.CompletedProcess(argv, 0, "", f"unlock_status: {unlock}\n")
+            name = argv[-1].split(":", 1)[1]
+            value = sizes.get(name, "")
+            return subprocess.CompletedProcess(argv, 0, "", f"partition-size:{name}: {value}\nFinished. Total time: 0.001s\n")
+
+        return run
+
+    def test_lidar_identity_is_lidar_only_from_the_descriptor(self):
+        self.assertEqual(INSTALLER.TARGET_INDEX["lidar"], {
+            "release_slug": "lidar", "fastboot_products": ["LIDAR"],
+            "soc": "mt8167", "arch": "arm64", "hw_profile": "lidar@1",
+            "boot_slots": ["boot_a", "boot_b"],
+        })
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot()):
+            self.assertEqual(INSTALLER.verify_fastboot_product("fastboot", "SERIAL"), "lidar")
+            self.assertEqual(INSTALLER.verify_fastboot_product("fastboot", "SERIAL", "lidar"), "lidar")
+            with self.assertRaises(INSTALLER.InstallerError):
+                INSTALLER.verify_fastboot_product("fastboot", "SERIAL", "radar_puffin")
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(product="RADAR")):
+            with self.assertRaises(INSTALLER.InstallerError):
+                INSTALLER.verify_fastboot_product("fastboot", "SERIAL", "lidar")
+
+    def test_lidar_pin_accepts_only_an_already_converted_kaeru_unit(self):
+        calls: list = []
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(kaeru="kaeru", unlock="false", calls=calls)):
+            self.assertIsNone(INSTALLER.plan_fastbrick("fastboot", "SERIAL", "lidar", None, ROOT))
+        self.assertFalse(any("flash" in call for call in calls), calls)
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(kaeru=None, calls=calls)):
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "already run Kaeru"):
+                INSTALLER.plan_fastbrick("fastboot", "SERIAL", "lidar", None, ROOT)
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(kaeru="silent", calls=calls)):
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "could not be determined"):
+                INSTALLER.plan_fastbrick("fastboot", "SERIAL", "lidar", None, ROOT)
+        self.assertFalse(any("flash" in call for call in calls), calls)
+        self.assertNotIn("lidar", INSTALLER.AMONET_PINS)
+
+    def test_lidar_userdata_geometry_is_exact(self):
+        self.assertEqual(INSTALLER.USERDATA_LIDAR_STOCK_BYTES, 9647071 * 512)
+        self.assertEqual(INSTALLER.USERDATA_TARGET_BYTES["lidar"], frozenset({4939300352}))
+        self.assertEqual(INSTALLER._validate_userdata_partition_size(4939300352, "lidar"), 4939296768)
+        for wrong in (INSTALLER.USERDATA_BYTES, INSTALLER.USERDATA_BISCUIT_STOCK_BYTES,
+                      4939300352 + 512, INSTALLER.USERDATA_MAX_BYTES):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(INSTALLER.InstallerError, "userdata partition size unsupported"):
+                INSTALLER._validate_userdata_partition_size(wrong, "lidar")
+        # Radar and Biscuit keep their floor-plus-cap contract and legacy variants.
+        self.assertEqual(INSTALLER._validate_userdata_partition_size(INSTALLER.USERDATA_RADAR_STOCK_BYTES + 4096, "radar_puffin"),
+                         0x4EFFC000)
+        for legacy in INSTALLER.USERDATA_SUPPORTED_BYTES:
+            self.assertEqual(INSTALLER._validate_userdata_partition_size(legacy, "biscuit"), legacy)
+
+    def test_lidar_payload_geometry_is_the_pinned_slot_layout(self):
+        pinned = {"boot_a": "1000000", "boot_b": "1000000"}
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(sizes=pinned)):
+            self.assertEqual(INSTALLER._verify_fastboot_payload_geometry("fastboot", "SERIAL", "lidar"), "pinned")
+        legacy = {"boot_a_x": "1000000", "boot_b_x": "1000000", "boot_a": "6e00000", "boot_b": "6e00000"}
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(sizes=legacy)):
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "lidar"):
+                INSTALLER._verify_fastboot_payload_geometry("fastboot", "SERIAL", "lidar")
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=self._fastboot(sizes={"boot_a": "1000000", "boot_b": "6e00000"})):
+            with self.assertRaises(INSTALLER.InstallerError):
+                INSTALLER._verify_fastboot_payload_geometry("fastboot", "SERIAL", "lidar")
+
+    def test_lidar_readback_uses_boot_a_and_boot_b_names(self):
+        digest = "ab" * 32
+
+        def run_for(partname):
+            def run(argv, timeout, *, check=True):
+                if argv[-1].endswith("/uevent"):
+                    return subprocess.CompletedProcess(argv, 0, f"PARTN=10\nPARTNAME={partname}\n", "")
+                return subprocess.CompletedProcess(argv, 0, f"{digest}  /dev/mmcblk0p10\n", "")
+            return run
+
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=run_for("boot_a")):
+            INSTALLER.verify_adb_payload_readback("adb", "SERIAL", "a", digest, 60, "lidar")
+        for name in ("boot_a_x", "boot_b", "expdb"):
+            with self.subTest(name=name), mock.patch.object(INSTALLER, "_run_command", side_effect=run_for(name)):
+                with self.assertRaisesRegex(INSTALLER.InstallerError, "identity mismatch"):
+                    INSTALLER.verify_adb_payload_readback("adb", "SERIAL", "a", digest, 60, "lidar")
+        # Radar keeps accepting either store name.
+        with mock.patch.object(INSTALLER, "_run_command", side_effect=run_for("boot_a_x")):
+            INSTALLER.verify_adb_payload_readback("adb", "SERIAL", "a", digest, 60, "radar_puffin")
+
+    def test_lidar_ota_plan_uses_the_descriptor_identity(self):
+        plan = INSTALLER._target_ota_plan("lidar", "lidar-v0.1.0")
+        self.assertEqual(plan["board"], "lidar")
+        self.assertEqual(plan["soc"], "mt8167")
+        self.assertEqual(plan["architecture"], "armv7")
+        self.assertEqual(plan["format"], "libreecho-ota-v3")
+        self.assertEqual(plan["release"], "lidar-v0.1.0")
+        self.assertEqual((plan["manifest_version"], plan["minimum_updater_schema"]), (1, 3))
+        self.assertEqual(INSTALLER.TARGET_INDEX["lidar"]["arch"], "arm64")
+        # Radar and Biscuit plans are unchanged.
+        self.assertEqual(INSTALLER._target_ota_plan("radar_puffin", "radar-puffin-v0.14.0")["soc"], "mt8163")
+
+    def test_lidar_state_board_is_accepted_and_unknown_targets_are_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            value = {"phase": "RELEASE_READY", "release": "radar-puffin-v0.1.0", "bundle_sha256": "a" * 64, "board": "lidar"}
+            path.write_text(json.dumps(value))
+            self.assertEqual(INSTALLER._read_state(path)["board"], "lidar")
+            path.write_text(json.dumps({**value, "board": "kaeru"}))
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "target"):
+                INSTALLER._read_state(path)
+
+
 class RadarKaeruMigrationKitTests(unittest.TestCase):
     """migrate.sh against a fake adb/fastboot and a file-backed radar (issue #325)."""
 

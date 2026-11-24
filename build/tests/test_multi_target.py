@@ -200,7 +200,7 @@ class DescriptorTests(unittest.TestCase):
                          ('mt8167_arm64_defconfig', 'libreecho-lidar.dtb'))
         self.assertIs(data['hardware_accepted'], False)
         self.assertEqual(accepted_targets(), PARITY_TARGETS)
-        self.assertNotIn('lidar', INSTALLER_TARGETS)
+        self.assertIn('lidar', KNOWN_TARGETS)
         # A cross-SoC descriptor is rejected in either direction.
         for target, soc in (('radar_puffin', 'mt8167'), ('lidar', 'mt8163')):
             changed = load_target(target); changed['soc'] = soc
@@ -253,15 +253,23 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(descriptor_sha256('biscuit'), '7c58bec0e9f09652d7ff7ce587c0eb58ee3bd5a22b320ff127f3f85c1690c454')
 
     def test_installer_embedded_mapping_matches_descriptors(self):
-        expected = {t: {k: load_target(t)[k] for k in ('release_slug', 'fastboot_products')} for t in INSTALLER_TARGETS}
-        self.assertEqual(INSTALLER.TARGET_INDEX, expected)
-        for product, target in [('RADAR', 'radar_puffin'), ('BISCUIT', 'biscuit')]:
+        self.assertEqual(set(INSTALLER.TARGET_INDEX), set(KNOWN_TARGETS))
+        for target in KNOWN_TARGETS:
+            descriptor = load_target(target)
+            entry = INSTALLER.TARGET_INDEX[target]
+            self.assertEqual((entry['release_slug'], entry['fastboot_products']),
+                             (descriptor['release_slug'], descriptor['fastboot_products']), target)
+            self.assertEqual(entry['soc'], descriptor['soc'], target)
+            self.assertEqual(entry['arch'], descriptor['arch'], target)
+            self.assertEqual(entry['hw_profile'], descriptor['platform']['hw_profile'], target)
+            self.assertEqual(entry['boot_slots'], ['boot_a', 'boot_b'], target)
+        for product, target in [('RADAR', 'radar_puffin'), ('BISCUIT', 'biscuit'), ('LIDAR', 'lidar')]:
             self.assertEqual(target_from_product(product), target)
             with mock.patch.object(INSTALLER, '_run_command', return_value=subprocess.CompletedProcess([], 0, '', 'product: ' + product)):
                 self.assertEqual(INSTALLER.verify_fastboot_product('mock', 'fixture'), target)
-                self.assertEqual(INSTALLER.verify_fastboot_product('mock', 'fixture', 'radar_puffin', 'radar_puffin'), 'radar_puffin')
-                if target == 'biscuit':
-                    with self.assertRaises(INSTALLER.InstallerError): INSTALLER.verify_fastboot_product('mock', 'fixture', 'radar_puffin')
+                self.assertEqual(INSTALLER.verify_fastboot_product('mock', 'fixture', target, target), target)
+                wrong = next(t for t in KNOWN_TARGETS if t != target)
+                with self.assertRaises(INSTALLER.InstallerError): INSTALLER.verify_fastboot_product('mock', 'fixture', wrong)
 
     def test_old_expdb_erase_guard_and_brom_path_are_gone(self):
         for name in ('LEGACY_EXPDB_ERASE_CLOSURES', 'require_legacy_expdb_erase', 'download_amonet',
