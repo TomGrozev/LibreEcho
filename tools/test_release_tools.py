@@ -717,6 +717,134 @@ class LidarInstallerGateTests(unittest.TestCase):
                 INSTALLER._read_state(path)
 
 
+class LidarBackupBehaviourTests(unittest.TestCase):
+    """The Lidar install path writes userdata and the two boot slots, nothing else.
+
+    The normal installer takes no backup: boot-chain backups belong to the Lidar
+    preparation command.  This mirrors Radar and Biscuit, whose one-shot path
+    also formats only userdata and flashes only their boot slots.
+    """
+
+    tag = "radar-puffin-v0.14.6"
+    prefix = "libreecho-lidar-v0.14.6"
+
+    def _release(self, root: Path) -> Path:
+        release = root / "release"
+        release.mkdir()
+        boot = bytearray(INSTALLER.BOOT_BYTES)
+        boot[:8] = b"ANDROID!"
+        struct.pack_into("<I", boot, 8, 1)
+        boot[64:64 + len(INSTALLER.BOOTOPT)] = INSTALLER.BOOTOPT
+        files = {
+            f"{self.prefix}-boot.img": bytes(boot),
+            f"{self.prefix}-ota-public-key.hex": b"a" * 64 + b"\n",
+            f"{self.prefix}-installer.py": b"# verified fixture installer\n",
+            f"{self.prefix}-release-notes.md": b"# fixture\n",
+        }
+        for name, data in files.items():
+            (release / name).write_bytes(data)
+        records = {name: {"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                   for name, data in files.items()}
+        manifest = {
+            "schema": INSTALLER.SCHEMA, "release": self.tag, "board": "lidar",
+            "soc": "mt8167", "image_profile": "ota", "service_profile": "production",
+            "boot": records[f"{self.prefix}-boot.img"],
+            "ota_public_key": records[f"{self.prefix}-ota-public-key.hex"],
+            "features": [], "amonet": {},
+        }
+        bundle = release / f"{self.prefix}-initial-install.tar"
+        with tarfile.open(bundle, "w") as archive:
+            data = json.dumps(manifest).encode()
+            item = tarfile.TarInfo("manifest.json"); item.size = len(data)
+            archive.addfile(item, io.BytesIO(data))
+            for name in files:
+                if not name.endswith(("-installer.py", "-release-notes.md")):
+                    archive.add(release / name, arcname=name)
+        (release / f"{self.prefix}-SHA256SUMS").write_text(
+            "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                    for path in sorted(release.iterdir()) if path.is_file()))
+        return release
+
+    def _command(self, calls):
+        def run(argv, timeout, *, check=True):
+            calls.append(list(argv))
+            if argv[-2:] == ["oem", "kaeru-version"]:
+                return subprocess.CompletedProcess(argv, 0, "", "(bootloader) kaeru-v2\nOKAY\n")
+            if "partition-size:" in argv[-1]:
+                name = argv[-1].split(":", 1)[1]
+                value = "0x1000000" if name in ("boot_a", "boot_b") else ""
+                return subprocess.CompletedProcess(argv, 0, "", f"partition-size:{name}: {value}\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return run
+
+    def test_lidar_writes_only_userdata_and_boot_slots_and_takes_no_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            calls: list = []
+            formatted: list = []
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(INSTALLER, "require_host_commands"))
+                stack.enter_context(mock.patch.object(INSTALLER, "prepare_fastboot_tools", return_value="fake-fastboot"))
+                stack.enter_context(mock.patch.object(INSTALLER, "select_fastboot_serial", return_value="SERIAL"))
+                stack.enter_context(mock.patch.object(INSTALLER, "wait_for_fastboot_serial", return_value="SERIAL"))
+                stack.enter_context(mock.patch.object(INSTALLER, "verify_fastboot_product", return_value="lidar"))
+                stack.enter_context(mock.patch.object(
+                    INSTALLER, "format_userdata_in_fastboot", side_effect=lambda *a, **k: formatted.append("userdata")))
+                stack.enter_context(mock.patch.object(INSTALLER, "reboot_to_installed_system"))
+                stack.enter_context(mock.patch.object(INSTALLER, "wait_for_first_boot_adb"))
+                stack.enter_context(mock.patch.object(INSTALLER, "collect_adb_diagnostics"))
+                stack.enter_context(mock.patch.object(INSTALLER, "verify_adb_payload_readback"))
+                stack.enter_context(mock.patch.object(INSTALLER, "stage_device_features"))
+                stack.enter_context(mock.patch.object(INSTALLER, "_complete_install", return_value={"phase": "WEBUI_FORWARDED"}))
+                stack.enter_context(mock.patch.object(INSTALLER, "_run_command", side_effect=self._command(calls)))
+                result = INSTALLER.one_shot(
+                    release, None, cache_root=root / "cache", state_root=root / "state",
+                    install_id="test", release_tag=self.tag, fastboot_bin="fake-fastboot",
+                    adb_bin="fake-adb", fastboot_serial="auto", execute_hardware=True,
+                    open_browser=False, target="lidar")
+
+        self.assertEqual(result["phase"], "WEBUI_FORWARDED")
+        self.assertEqual(formatted, ["userdata"])
+        flashed = [call[call.index("flash") + 1] for call in calls if "flash" in call]
+        self.assertEqual(flashed, ["boot_a", "boot_b"])
+        self.assertEqual(set(flashed) | set(formatted), {"userdata", "boot_a", "boot_b"})
+        self.assertEqual(flashed, INSTALLER.TARGET_INDEX["lidar"]["boot_slots"])
+        lowered = " ".join(" ".join(call) for call in calls).lower()
+        for forbidden in ("erase", "backup", "pull", "dump", "fetch"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lowered)
+        self.assertFalse([name for name in dir(INSTALLER) if "backup" in name.lower()])
+        # Radar and Biscuit keep the same userdata-only shape.
+        for target in ("radar_puffin", "biscuit"):
+            self.assertEqual(set(INSTALLER.TARGET_INDEX[target]["boot_slots"]) | {"userdata"},
+                             {"userdata", "boot_a", "boot_b"})
+
+    def test_formatting_lidar_userdata_flashes_only_userdata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_executable(root, "mke2fs")
+            fake_executable(root, "dumpe2fs")
+            flashes: list = []
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(INSTALLER, "verify_fastboot_product", return_value="lidar"))
+                stack.enter_context(mock.patch.object(
+                    INSTALLER, "_fastboot_partition_size", return_value=INSTALLER.USERDATA_LIDAR_STOCK_BYTES))
+                stack.enter_context(mock.patch.object(INSTALLER, "_userdata_ext4_features", return_value="extents"))
+                stack.enter_context(mock.patch.object(INSTALLER, "_run_command",
+                                                      return_value=subprocess.CompletedProcess([], 0, "", "")))
+                def write_sparse(_raw, sparse, *_):
+                    Path(sparse).write_bytes(b"sparse")
+                    return 1234
+                stack.enter_context(mock.patch.object(INSTALLER, "_write_userdata_sparse", side_effect=write_sparse))
+                stack.enter_context(mock.patch.object(INSTALLER, "_validate_android_sparse_image", return_value=1234))
+                stack.enter_context(mock.patch.object(INSTALLER, "_run_command_with_heartbeat",
+                                                      side_effect=lambda argv, *a, **k: flashes.append(list(argv))))
+                INSTALLER.format_userdata_in_fastboot(str(root / "fastboot"), "SERIAL", 30)
+        self.assertEqual(len(flashes), 1)
+        self.assertEqual(flashes[0][flashes[0].index("flash") + 1], "userdata")
+
+
 class RadarKaeruMigrationKitTests(unittest.TestCase):
     """migrate.sh against a fake adb/fastboot and a file-backed radar (issue #325)."""
 
