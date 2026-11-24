@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import grp
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -222,6 +223,19 @@ LK_EXT_MAGIC = 0x58891689
 LK_HEADER_MIN = 80
 LK_HEADER_DEFAULT = 512
 LK_ALIGNMENT = 8
+# Platform AGENTS.md:84-88 ("Boot-chain safety" rule 2) requires the chain
+# generation to be established before any flash write. On the amonet v2.0.0
+# chain expdb[0:16] starts with the MTK image header of the Kaeru LK-stage
+# payload; an ASCII FASTBOOT_PLEASE marker there means the chain is broken.
+EXPDB_PREFIX_BYTES = 16
+MTK_IMAGE_MAGIC = LK_MAGIC.to_bytes(4, "little")
+FASTBOOT_PLEASE = b"FASTBOOT_PLEASE"
+KAERU_CHAIN_GENERATION = "kaeru-v2"
+# Lidar Kaeru fastboot USB identity (Platform lidar_install.py:31-33).
+LIDAR_FASTBOOT_VID = 0x0BB4
+LIDAR_FASTBOOT_PID = 0x0C01
+LIDAR_FETCH_MAX = 0x100000
+USB_READ_TIMEOUT_MS = 10000
 # A stock bootloader refuses `oem kaeru-version`; anything else is indeterminate.
 FASTBOOT_COMMAND_REFUSED = re.compile(
     r"FAIL(?:ED)?[^\n]*?(?:unknown command|not allowed|not supported|unsupported|invalid command|unrecognized|restricted on locked)",
@@ -968,6 +982,152 @@ def _expdb_kaeru_chain_ok(read: Any) -> bool:
     return kaeru is not None and kaeru["name"] == b"kaeru" and kaeru["ext"] == LK_EXT_MAGIC
 
 
+def _require_lidar_pyusb(target: str | None) -> None:
+    """The Lidar chain check reads expdb over USB; refuse before the brick, not in fastboot."""
+    if target != "lidar" or importlib.util.find_spec("usb") is not None:
+        return
+    raise InstallerError(
+        "HOST PREFLIGHT: pyusb is required for the Lidar expdb chain check; install "
+        "python-pyusb (Arch) or python3-usb (Debian) before the brick"
+    )
+
+
+def _read_lidar_fastboot_range(partition: str, offset: int, length: int) -> bytes:
+    """Read one bounded Kaeru ``fetch:<partition>:<off>:<len>`` over USB.
+
+    The stock fastboot client has no range argument, and expdb is 10 MiB while
+    Kaeru refuses any fetch above 1 MiB, so the 16-byte prefix is asked for
+    directly on the fastboot USB interface (same protocol as Platform
+    ``lidar_install.py`` Fastboot.fetch_range).
+    """
+    if not 0 < length <= LIDAR_FETCH_MAX:
+        raise InstallerError(f"invalid fastboot fetch length: {length}")
+    try:
+        import usb.core
+        import usb.util
+    except ImportError as error:
+        raise InstallerError(
+            "pyusb is required for the Lidar expdb chain check; install "
+            "python-pyusb (Arch) or python3-usb (Debian)"
+        ) from error
+    try:
+        found = list(usb.core.find(find_all=True, idVendor=LIDAR_FASTBOOT_VID,
+                                   idProduct=LIDAR_FASTBOOT_PID) or ())
+    except usb.core.USBError as error:
+        raise InstallerError(f"cannot enumerate fastboot USB devices: {error}") from error
+    if len(found) != 1:
+        raise InstallerError(
+            f"expected exactly one Lidar fastboot USB device "
+            f"{LIDAR_FASTBOOT_VID:04x}:{LIDAR_FASTBOOT_PID:04x}, found {len(found)}"
+        )
+    device = found[0]
+    interface = None
+    claimed = False
+    data = bytearray()
+    try:
+        try:
+            configuration = device.get_active_configuration()
+        except usb.core.USBError:
+            device.set_configuration()
+            configuration = device.get_active_configuration()
+        interface = configuration[(0, 0)]
+
+        def bulk_endpoint(direction: int):
+            return usb.util.find_descriptor(
+                interface, custom_match=lambda endpoint: (
+                    usb.util.endpoint_direction(endpoint.bEndpointAddress) == direction
+                    and usb.util.endpoint_type(endpoint.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK))
+
+        endpoint_out = bulk_endpoint(usb.util.ENDPOINT_OUT)
+        endpoint_in = bulk_endpoint(usb.util.ENDPOINT_IN)
+        if endpoint_out is None or endpoint_in is None:
+            raise InstallerError("fastboot USB interface has no bulk endpoints")
+        usb.util.claim_interface(device, interface.bInterfaceNumber)
+        claimed = True
+
+        def read_reply() -> bytes:
+            while True:
+                reply = bytes(endpoint_in.read(64, timeout=USB_READ_TIMEOUT_MS))
+                if reply[:4] == b"INFO":
+                    continue
+                if reply[:4] == b"FAIL":
+                    raise InstallerError(
+                        f"usb fetch {partition} failed: "
+                        f"{reply[4:].decode('ascii', 'replace')}")
+                return reply
+
+        command = f"fetch:{partition}:0x{offset:08x}:0x{length:08x}"
+        endpoint_out.write(command.encode("ascii"))
+        header = read_reply()
+        if header[:4] != b"DATA" or len(header) != 12:
+            raise InstallerError(f"usb fetch {partition}: expected DATA header, got {header!r}")
+        while len(data) < length:
+            chunk = endpoint_in.read(min(64 * 1024, length - len(data)),
+                                     timeout=USB_READ_TIMEOUT_MS)
+            if not chunk:
+                raise InstallerError(
+                    f"usb fetch {partition}: stream ended at {len(data)} of {length} bytes")
+            data += bytes(chunk)
+        if read_reply()[:4] != b"OKAY":
+            raise InstallerError(f"usb fetch {partition}: expected OKAY")
+    except usb.core.USBError as error:
+        raise InstallerError(f"usb fetch {partition} failed: {error}") from error
+    finally:
+        if claimed and interface is not None:
+            usb.util.release_interface(device, interface.bInterfaceNumber)
+        usb.util.dispose_resources(device)
+    return bytes(data)
+
+
+def check_expdb_chain_generation(prefix: bytes | None) -> str:
+    """Return the chain generation for expdb[0:16], or refuse the write."""
+    if prefix is None or len(prefix) < EXPDB_PREFIX_BYTES:
+        got = 0 if prefix is None else len(prefix)
+        raise InstallerError(
+            f"expdb[0:{EXPDB_PREFIX_BYTES}] is unreadable (got {got} bytes); "
+            "refusing to write flash"
+        )
+    if prefix.startswith(FASTBOOT_PLEASE):
+        raise InstallerError(
+            "expdb begins with FASTBOOT_PLEASE: the boot chain is already broken; "
+            "refusing to write flash"
+        )
+    if prefix[:len(MTK_IMAGE_MAGIC)] != MTK_IMAGE_MAGIC:
+        raise InstallerError(
+            f"expdb[0:{len(MTK_IMAGE_MAGIC)}] is {prefix[:len(MTK_IMAGE_MAGIC)].hex()}, "
+            f"expected MTK magic {MTK_IMAGE_MAGIC.hex()} (amonet v2.0.0 Kaeru "
+            "payload); refusing to write flash"
+        )
+    return KAERU_CHAIN_GENERATION
+
+
+def require_lidar_expdb_generation(fastboot_bin: str, serial: str) -> str:
+    """Establish the Lidar chain generation before a flash write."""
+    _append_log("EXPDB GUARD: reading expdb[0:16] before a flash write")
+    probe = _run_command([fastboot_bin, "-s", serial, "oem", "fetch-enable"], 20, check=False)
+    if probe.returncode != 0:
+        raise InstallerError(
+            "cannot enable Kaeru fetch for the expdb chain check; refusing to write flash"
+        )
+    generation = check_expdb_chain_generation(
+        _read_lidar_fastboot_range("expdb", 0, EXPDB_PREFIX_BYTES))
+    print(f"FASTBOOT STAGE: expdb[0:{EXPDB_PREFIX_BYTES}] is {generation}; "
+          "chain generation verified before write.", flush=True)
+    return generation
+
+
+def _require_flash_chain(fastboot_bin: str, serial: str, target: str | None) -> None:
+    """The Lidar chain check runs before every flash write; others are unchanged."""
+    if target == "lidar":
+        require_lidar_expdb_generation(fastboot_bin, serial)
+
+
+def _flash_fastboot_partition(fastboot_bin: str, serial: str, partition: str,
+                              image: Any, timeout: float, target: str | None = None) -> None:
+    _require_flash_chain(fastboot_bin, serial, target)
+    _run_command([fastboot_bin, "-s", serial, "flash", partition, str(image)], timeout)
+
+
 def _adb_expdb_node(adb_bin: str, serial: str) -> str | None:
     """Resolve the expdb block node from sysfs PARTNAME; exactly one match or None."""
     result = _run_command(
@@ -1277,8 +1437,10 @@ def _userdata_ext4_features(mke2fs: Path, scratch: Path, timeout: float) -> str:
     return ",".join(features)
 
 
-def format_userdata_in_fastboot(fastboot_bin: str, serial: str, timeout: float) -> None:
+def format_userdata_in_fastboot(fastboot_bin: str, serial: str, timeout: float,
+                                target: str | None = None) -> None:
     """Build and flash a compatible sparse ext4 filesystem to userdata."""
+    _require_flash_chain(fastboot_bin, serial, target)
     print("FASTBOOT STAGE: validating target product and partition geometry.", flush=True)
     detected = verify_fastboot_product(fastboot_bin, serial)
     partition_size = _fastboot_partition_size(fastboot_bin, serial, "userdata")
@@ -2331,6 +2493,7 @@ def one_shot(
             target = verify_fastboot_product(fastboot_bin, select_fastboot_serial(fastboot_bin, fastboot_serial))
         if target not in TARGET_INDEX:
             raise InstallerError("unknown target")
+        _require_lidar_pyusb(target)
         if release_dir is None:
             release_dir = download_release(release_tag, release_repository, download_root, target)
         else:
@@ -2449,12 +2612,13 @@ def one_shot(
         # Read-only geometry/chain proof first: a refusal leaves userdata unformatted too.
         print("FASTBOOT STAGE: verifying boot payload partition geometry.", flush=True)
         _verify_fastboot_payload_geometry(fastboot_bin, serial, target)
-        format_userdata_in_fastboot(fastboot_bin, serial, fastboot_timeout)
+        format_userdata_in_fastboot(fastboot_bin, serial, fastboot_timeout, target)
         _write_state(state_path, {"phase": "AMONET_HANDOFF", "release": release_tag, "bundle_sha256": bundle_sha, "userdata_formatted": True})
         _write_state(state_path, {"phase": "FASTBOOT_READY", "release": release_tag, "bundle_sha256": bundle_sha})
         for slot in selected:
             print(f"FASTBOOT STAGE: flashing verified boot payload to boot_{slot}.", flush=True)
-            _run_command([fastboot_bin, "-s", serial, "flash", f"boot_{slot}", str(boot)], fastboot_timeout)
+            _flash_fastboot_partition(fastboot_bin, serial, f"boot_{slot}", boot,
+                                      fastboot_timeout, target)
         _write_state(state_path, {"phase": "BOOT_WRITTEN", "release": release_tag, "bundle_sha256": bundle_sha})
         print("FASTBOOT STAGE: rebooting into the installed LibreEcho boot image.", flush=True)
         reboot_to_installed_system(fastboot_bin, serial, fastboot_timeout)
@@ -2766,7 +2930,7 @@ def continue_one_shot(
             fastboot = wait_for_fastboot_serial(fastboot_bin, fastboot_serial, fastboot_timeout)
             print(f"FASTBOOT STAGE: detected device {fastboot}; formatting userdata.", flush=True)
             verify_fastboot_product(fastboot_bin, fastboot, saved_target, target)
-            format_userdata_in_fastboot(fastboot_bin, fastboot, fastboot_timeout)
+            format_userdata_in_fastboot(fastboot_bin, fastboot, fastboot_timeout, saved_target)
             _write_state(state_path, {"phase": "READBACK_VERIFIED", "release": release, "bundle_sha256": state["bundle_sha256"], "userdata_formatted": True})
             print("FASTBOOT STAGE: rebooting after userdata repair.", flush=True)
             reboot_to_installed_system(fastboot_bin, fastboot, fastboot_timeout)
@@ -2789,12 +2953,13 @@ def continue_one_shot(
             print("FASTBOOT STAGE: verifying boot payload partition geometry.", flush=True)
             _verify_fastboot_payload_geometry(fastboot_bin, serial, saved_target)
             if not userdata_formatted:
-                format_userdata_in_fastboot(fastboot_bin, serial, fastboot_timeout)
+                format_userdata_in_fastboot(fastboot_bin, serial, fastboot_timeout, saved_target)
             _write_state(state_path, {"phase": "AMONET_HANDOFF", "release": release, "bundle_sha256": state["bundle_sha256"], "userdata_formatted": True})
             _write_state(state_path, {"phase": "FASTBOOT_READY", "release": release, "bundle_sha256": state["bundle_sha256"]})
             for slot in selected:
                 print(f"FASTBOOT STAGE: flashing verified boot payload to boot_{slot}.", flush=True)
-                _run_command([fastboot_bin, "-s", serial, "flash", f"boot_{slot}", str(boot)], fastboot_timeout)
+                _flash_fastboot_partition(fastboot_bin, serial, f"boot_{slot}", boot,
+                                          fastboot_timeout, saved_target)
             _write_state(state_path, {"phase": "BOOT_WRITTEN", "release": release, "bundle_sha256": state["bundle_sha256"]})
             print("FASTBOOT STAGE: rebooting into the installed LibreEcho boot image.", flush=True)
             reboot_to_installed_system(fastboot_bin, serial, fastboot_timeout)

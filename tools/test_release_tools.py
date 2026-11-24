@@ -694,6 +694,56 @@ class LidarInstallerGateTests(unittest.TestCase):
         with mock.patch.object(INSTALLER, "_run_command", side_effect=run_for("boot_a_x")):
             INSTALLER.verify_adb_payload_readback("adb", "SERIAL", "a", digest, 60, "radar_puffin")
 
+    def test_lidar_expdb_generation_gate(self):
+        v2 = b"\x88\x16\x88\x58\xd0\x40\x03\x00LK\x00\x00\x00\x00\x00\x00"
+        self.assertEqual(INSTALLER.check_expdb_chain_generation(v2), "kaeru-v2")
+        for prefix in (b"FASTBOOT_PLEASE\0", b"\0" * 16, None, v2[:8]):
+            with self.subTest(prefix=prefix), \
+                    self.assertRaises(INSTALLER.InstallerError):
+                INSTALLER.check_expdb_chain_generation(prefix)
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(INSTALLER, "_run_command", return_value=ok) as run, \
+             mock.patch.object(INSTALLER, "_read_lidar_fastboot_range", return_value=v2) as read:
+            self.assertEqual(INSTALLER.require_lidar_expdb_generation("fastboot", "SERIAL"), "kaeru-v2")
+        read.assert_called_once_with("expdb", 0, 16)
+        self.assertEqual(run.call_args[0][0][-2:], ["oem", "fetch-enable"])
+        with mock.patch.object(INSTALLER, "_run_command",
+                               return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             mock.patch.object(INSTALLER, "_read_lidar_fastboot_range",
+                               return_value=b"FASTBOOT_PLEASE\0"):
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "already broken"):
+                INSTALLER.require_lidar_expdb_generation("fastboot", "SERIAL")
+
+    def test_every_lidar_flash_runs_the_chain_gate_first(self):
+        boot = ROOT / "boot.img"
+        with mock.patch.object(INSTALLER, "require_lidar_expdb_generation") as gate, \
+             mock.patch.object(INSTALLER, "_run_command") as run:
+            INSTALLER._flash_fastboot_partition("fastboot", "SERIAL", "boot_a", boot, 30, "lidar")
+        gate.assert_called_once_with("fastboot", "SERIAL")
+        self.assertIn("flash", run.call_args[0][0])
+        with mock.patch.object(INSTALLER, "require_lidar_expdb_generation",
+                               side_effect=INSTALLER.InstallerError("expdb mismatch")), \
+             mock.patch.object(INSTALLER, "_run_command") as run:
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "expdb mismatch"):
+                INSTALLER._flash_fastboot_partition("fastboot", "SERIAL", "boot_a", boot, 30, "lidar")
+        run.assert_not_called()
+        # Radar keeps its existing write path: no expdb read and the same command.
+        with mock.patch.object(INSTALLER, "require_lidar_expdb_generation") as gate, \
+             mock.patch.object(INSTALLER, "_run_command") as run:
+            INSTALLER._flash_fastboot_partition("fastboot", "SERIAL", "boot_a", boot, 30, "radar_puffin")
+        gate.assert_not_called()
+        run.assert_called_once()
+
+    def test_lidar_userdata_format_is_gated_before_device_commands(self):
+        with mock.patch.object(INSTALLER, "require_lidar_expdb_generation",
+                               side_effect=INSTALLER.InstallerError("expdb unreadable")), \
+             mock.patch.object(INSTALLER, "_run_command") as run, \
+             mock.patch.object(INSTALLER, "_run_command_with_heartbeat") as heartbeat:
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "expdb unreadable"):
+                INSTALLER.format_userdata_in_fastboot("fastboot", "SERIAL", 30, "lidar")
+        run.assert_not_called()
+        heartbeat.assert_not_called()
+
     def test_lidar_ota_plan_uses_the_descriptor_identity(self):
         plan = INSTALLER._target_ota_plan("lidar", "lidar-v0.1.0")
         self.assertEqual(plan["board"], "lidar")
@@ -797,6 +847,11 @@ class LidarBackupBehaviourTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(INSTALLER, "verify_adb_payload_readback"))
                 stack.enter_context(mock.patch.object(INSTALLER, "stage_device_features"))
                 stack.enter_context(mock.patch.object(INSTALLER, "_complete_install", return_value={"phase": "WEBUI_FORWARDED"}))
+                expdb_gate = stack.enter_context(mock.patch.object(
+                    INSTALLER, "require_lidar_expdb_generation", return_value="kaeru-v2"))
+                # Host dependencies belong to the preflight; this test drives the
+                # write shape with a stubbed transport.
+                stack.enter_context(mock.patch.object(INSTALLER, "_require_lidar_pyusb"))
                 stack.enter_context(mock.patch.object(INSTALLER, "_run_command", side_effect=self._command(calls)))
                 result = INSTALLER.one_shot(
                     release, None, cache_root=root / "cache", state_root=root / "state",
@@ -806,6 +861,7 @@ class LidarBackupBehaviourTests(unittest.TestCase):
 
         self.assertEqual(result["phase"], "WEBUI_FORWARDED")
         self.assertEqual(formatted, ["userdata"])
+        expdb_gate.assert_called()
         flashed = [call[call.index("flash") + 1] for call in calls if "flash" in call]
         self.assertEqual(flashed, ["boot_a", "boot_b"])
         self.assertEqual(set(flashed) | set(formatted), {"userdata", "boot_a", "boot_b"})

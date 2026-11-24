@@ -120,6 +120,9 @@ installer leaves it intact.
   `/sys/class/block/*/uevent` (`PARTNAME=expdb`, exactly one match), and that
   partition holds the upstream LK header followed by the `kaeru` header at
   round8(512 + LK data size).
+- The Lidar chain check reads `expdb[0:16]` over the fastboot USB interface, so
+  a Lidar one-shot needs `pyusb` on the host (`python-pyusb` on Arch,
+  `python3-usb` on Debian). It refuses before the brick when it is missing.
 - A fresh `one-shot` never discards an existing installation. An unresolved
   brick marker, or a completed or partly completed installation, stops the run
   and points to `continue-one-shot`. Use a new `--install-id` for a separate
