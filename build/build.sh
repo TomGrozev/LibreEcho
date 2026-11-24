@@ -51,7 +51,9 @@ KERNEL_SRC="$(cd -- "$KERNEL_SRC_INPUT" && pwd -P)"
 TOOLING_SRC_INPUT="${LIBREECHO_TOOLING_SRC:?ERROR: set LIBREECHO_TOOLING_SRC explicitly}"
 [[ -d "$TOOLING_SRC_INPUT" ]] || { echo "ERROR: tooling source directory not found: $TOOLING_SRC_INPUT" >&2; exit 1; }
 TOOLING_SRC="$(cd -- "$TOOLING_SRC_INPUT" && pwd -P)"
-TOOLS_DIR="$TOOLING_SRC/tools/mt8163-arm32"
+# TOOLS_DIR and every path derived from it are target-scoped, so they are set
+# after the descriptor is resolved (see the KERNEL_ARCH block).
+TOOLS_DIR=
 KERNEL_OUT_INPUT="${LIBREECHO_KERNEL_OUT:?ERROR: set LIBREECHO_KERNEL_OUT explicitly outside source trees}"
 mkdir -p "$KERNEL_OUT_INPUT"
 KERNEL_OUT="$(cd -- "$KERNEL_OUT_INPUT" && pwd -P)"
@@ -77,7 +79,6 @@ AUDIO_TOOLS_DIR="$GENERATED_ROOT/audio-tools"
 WIRELESS_TOOLS_OUTPUT="$GENERATED_ROOT/wireless-tools"
 WIRELESS_REGDB_OUTPUT="$GENERATED_ROOT/wireless-regdb"
 LIBSODIUM_OUTPUT="$GENERATED_ROOT/libsodium-1.0.18"
-NETWORK_TOOLS_BUILDER="$TOOLS_DIR/network-tools/build_wireless_tools.sh"
 AIRPLAY_SYSROOT="${LIBREECHO_AIRPLAY_SYSROOT:?ERROR: set LIBREECHO_AIRPLAY_SYSROOT explicitly}"
 if [[ -n "${LIBREECHO_AIRPLAY_CXX:-}" ]]; then
   AIRPLAY_CXX="$LIBREECHO_AIRPLAY_CXX"
@@ -118,8 +119,6 @@ CORE_GCC_LIBDIR="${LIBREECHO_CORE_GCC_LIBDIR:?ERROR: set exact ARMHF GCC runtime
 # the release workflow installs outside the source trees.
 MBEDTLS_SOURCE_ARCHIVE="${LIBREECHO_MBEDTLS_SOURCE_ARCHIVE:?ERROR: set LIBREECHO_MBEDTLS_SOURCE_ARCHIVE explicitly}"
 MBEDTLS_BUILD_PYTHON="${LIBREECHO_MBEDTLS_BUILD_PYTHON:?ERROR: set LIBREECHO_MBEDTLS_BUILD_PYTHON explicitly}"
-MBEDTLS_BUILDER="$TOOLS_DIR/mbedtls/build_mbedtls.sh"
-MBEDTLS_SOURCE_LOCK="$TOOLS_DIR/mbedtls/SOURCE.lock"
 # The bundle builds its own source-locked Opus stack, not a caller-certified prefix.
 OPUS_ARCHIVES_DIR="${LIBREECHO_OPUS_ARCHIVES_DIR:?ERROR: set LIBREECHO_OPUS_ARCHIVES_DIR explicitly}"
 SHERPA_SOURCE=
@@ -154,9 +153,6 @@ ASSISTANT_CA_BUNDLE="$INPUTS/ca-certificates-20260601.crt"
 ASSISTANT_CA_COPYRIGHT="$INPUTS/ca-certificates-20260601.copyright"
 SSH_ENABLED="${LIBREECHO_SSH_ENABLED:-0}"
 JOBS="${JOBS:-$(nproc)}"
-OTA_DIR="$TOOLS_DIR/ota"
-PLATFORM_RUNTIME_VERIFIER="$TOOLS_DIR/feature_runtime/verify_runtime.py"
-OTA_PUBLIC_KEY="$OTA_DIR/ota-public-key.hex"
 OTA_SIGNING_KEY="${LIBREECHO_OTA_SIGNING_KEY:-$PRIVATE_ROOT/ota-signing-key.hex}"
 OTA_SIGNING_MODE="${LIBREECHO_OTA_SIGNING_MODE:-github}"
 # Release workflow dispatches pass v2 explicitly. Local builds which do not
@@ -181,8 +177,6 @@ OTA_MUSL_TARGET_GCC_LIB="$(
 )"
 ADBD_SOURCE="${LIBREECHO_ADBD_SOURCE:?ERROR: set LIBREECHO_ADBD_SOURCE to a clean pinned AOSP system/core checkout}"
 ADBD_KERNEL_HEADERS="${LIBREECHO_ADBD_KERNEL_HEADERS:?ERROR: set LIBREECHO_ADBD_KERNEL_HEADERS to an exported Linux UAPI tree}"
-ADBD_BUILDER="$TOOLS_DIR/adbd/build_adbd.sh"
-BOOT_ENVELOPE_GENERATOR="$TOOLS_DIR/generate_boot_envelope.py"
 KERNEL_ZIMAGE_OVERRIDE="${LIBREECHO_KERNEL_ZIMAGE_OVERRIDE:-}"
 KERNEL_ZIMAGE_OVERRIDE_SHA256="${LIBREECHO_KERNEL_ZIMAGE_OVERRIDE_SHA256:-}"
 KERNEL_SYSTEM_MAP_OVERRIDE="${LIBREECHO_KERNEL_SYSTEM_MAP_OVERRIDE:-}"
@@ -402,20 +396,37 @@ TARGET="${selected_targets[0]}"
 target_values="$(python3 -B "$PIPELINE/ci/validate-targets.py" --targets "$TARGET" --shell)"
 eval "$target_values" # only schema-validated identifiers/digests; no user strings
 case "$KERNEL_ARCH" in
-  arm) KERNEL_IMAGE_NAME=zImage; KERNEL_BOOT_SUBDIR=arch/arm/boot ;;
-  arm64) KERNEL_IMAGE_NAME=Image; KERNEL_BOOT_SUBDIR=arch/arm64/boot ;;
+  arm)
+    KERNEL_IMAGE_NAME=zImage
+    KERNEL_BOOT_SUBDIR=arch/arm/boot
+    KERNEL_DTS_SUBDIR=arch/arm/boot/dts
+    KERNEL_DTB_TARGET=$KERNEL_DTB_NAME
+    KERNEL_CROSS="${LIBREECHO_KERNEL_CROSS:-$CROSS}"
+    ;;
+  arm64)
+    KERNEL_IMAGE_NAME=Image
+    KERNEL_BOOT_SUBDIR=arch/arm64/boot
+    KERNEL_DTS_SUBDIR=arch/arm64/boot/dts/mediatek
+    KERNEL_DTB_TARGET=mediatek/$KERNEL_DTB_NAME
+    # The host cross is pinned separately from the armv7 userspace cross; no
+    # userspace binary is ever built with it.
+    KERNEL_CROSS="${LIBREECHO_AARCH64_CROSS:-}"
+    [[ -n "$KERNEL_CROSS" ]] || {
+      echo "ERROR: target $TARGET needs the pinned aarch64 kernel cross; set LIBREECHO_AARCH64_CROSS to the staged usr/bin/aarch64-linux-gnu- prefix" >&2
+      exit 1
+    }
+    ;;
   *) echo "ERROR: unsupported descriptor kernel arch: $KERNEL_ARCH" >&2; exit 1 ;;
 esac
-KERNEL_CROSS="${LIBREECHO_KERNEL_CROSS:-$CROSS}"
-# ponytail: hosted CI pins only the armhf userspace cross, so an arm64 kernel
-# cannot be built there yet. Upgrade path: add a pinned aarch64 cross to
-# prepare-public-inputs and export LIBREECHO_KERNEL_CROSS, and give the
-# MT8163-only production checks below an mt8167 branch.
-if [[ "$KERNEL_ARCH" != arm && "$KERNEL_CROSS" == "$CROSS" ]]; then
-  echo "ERROR: target $TARGET needs an arm64 kernel cross toolchain; hosted CI provisions none (set LIBREECHO_KERNEL_CROSS)" >&2
-  exit 1
-fi
 TOOLS_DIR="$TOOLING_SRC/tools/$TOOLS_PROFILE"
+NETWORK_TOOLS_BUILDER="$TOOLS_DIR/network-tools/build_wireless_tools.sh"
+OTA_DIR="$TOOLS_DIR/ota"
+OTA_PUBLIC_KEY="$OTA_DIR/ota-public-key.hex"
+PLATFORM_RUNTIME_VERIFIER="$TOOLS_DIR/feature_runtime/verify_runtime.py"
+MBEDTLS_BUILDER="$TOOLS_DIR/mbedtls/build_mbedtls.sh"
+MBEDTLS_SOURCE_LOCK="$TOOLS_DIR/mbedtls/SOURCE.lock"
+ADBD_BUILDER="$TOOLS_DIR/adbd/build_adbd.sh"
+BOOT_ENVELOPE_GENERATOR="$TOOLS_DIR/generate_boot_envelope.py"
 platform_args() {
   local output
   output="$(python3 -B "$PIPELINE/ci/platform-target-args.py" --tool "$1" --target "$TARGET" "${@:2}")" || return
@@ -479,6 +490,9 @@ if [[ "$PUBLIC_RELEASE_MODE" == 1 ]]; then
   product_state=clean
   product_diffsha="$(source_state_sha256 "$PRODUCT_SRC")"
 fi
+if [[ "$KERNEL_ARCH" == arm ]]; then
+# The audio FPGA and its SPI driver are MT8163 hardware; MT8516/Lidar has its
+# own machine driver, required below.
 if [[ "$FEATURES_ENABLED" == 1 && "$SERVICE_PROFILE" == production ]]; then
   fpga_firmware="$KERNEL_SRC/firmware/i2s_to_spi_v34.bin"
   [[ -f "$fpga_firmware" && ! -L "$fpga_firmware" ]] || {
@@ -492,6 +506,7 @@ if [[ "$FEATURES_ENABLED" == 1 && "$SERVICE_PROFILE" == production ]]; then
     "$KERNEL_SRC/arch/$KERNEL_ARCH/configs/$KERNEL_DEFCONFIG" || {
     echo "ERROR: full-feature production build requires the verified MT8163 audio driver" >&2; exit 1
   }
+fi
 fi
 case "$OTA_SIGNING_MODE" in github|local) ;; *) echo "ERROR: invalid OTA signing mode: $OTA_SIGNING_MODE" >&2; exit 1 ;; esac
 case "$OTA_FORMAT" in
@@ -515,7 +530,7 @@ git -C "$TOOLING_SRC" rev-parse --show-toplevel >/dev/null 2>&1 || {
   echo "ERROR: tooling source is not a Git worktree: $TOOLING_SRC" >&2; exit 1;
 }
 [[ -d "$TOOLS_DIR" ]] || {
-  echo "ERROR: MT8163 tooling directory not found: $TOOLS_DIR" >&2; exit 1;
+  echo "ERROR: target tooling directory not found: $TOOLS_DIR" >&2; exit 1;
 }
 [[ -d "$UI_SOURCE" ]] || { echo "ERROR: missing LibreEcho-UI source: $UI_SOURCE" >&2; exit 1; }
 if [[ "$FEATURES_ENABLED" == 1 ]]; then
@@ -868,9 +883,9 @@ echo "wpa_supplicant_sha256=$wpa_supplicant_sha"
 
 if ((defconfig)) || [[ ! -f "$KERNEL_OUT/.config" ]]; then
   if ((defconfig)); then
-    echo "=== regenerating ARM32 defconfig (requested) ==="
+    echo "=== regenerating $KERNEL_ARCH defconfig (requested) ==="
   else
-    echo "=== generating ARM32 defconfig (new build directory) ==="
+    echo "=== generating $KERNEL_ARCH defconfig (new build directory) ==="
   fi
   make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH="$KERNEL_ARCH" CROSS_COMPILE="$KERNEL_CROSS" \
     LD="${KERNEL_CROSS}ld.bfd" "$KERNEL_DEFCONFIG"
@@ -920,46 +935,68 @@ require_any_config() {
 }
 
 require_any_config y USB_MTK_HDRC USB_MUSB_HDRC
-if grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config"; then
+if [[ "$KERNEL_ARCH" == arm ]] && grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config"; then
   :
 elif grep -qxF 'CONFIG_USB_MUSB_HDRC=y' "$KERNEL_OUT/.config"; then
-  # Generic FunctionFS is not enough: without the MT8163 glue and configfs
-  # functions there is no UDC to bind and neither ADB nor RNDIS can enumerate.
+  # Generic FunctionFS is not enough: without the SoC glue and configfs
+  # functions there is no UDC to bind and neither ADB nor networking can
+  # enumerate.
   require_config CONFIGFS_FS y
   require_config USB_MUSB_MEDIATEK y
   require_config USB_CONFIGFS y
   require_config USB_CONFIGFS_F_FS y
-  require_config USB_CONFIGFS_RNDIS y
-  require_config PINCTRL_MT8163 y
-  require_config MTK_MT8163_CONSYS y
-  require_config MTK_COMBO_WIFI y
-  require_config LEDS_CLASS_MULTICOLOR y
-  require_config LEDS_IS31FL32XX y
-  require_config MTK_MT8163_BLUEZ_HCI y
-  # Full-parity board closure: PMIC/reset/RTC/input/sensors/LEDs plus the
-  # feature-payload and discovery primitives used by production services.
-  require_config MFD_MT6397 y
-  require_config REGULATOR_MT6323 y
-  require_config POWER_RESET_MT6323 y
-  require_config RTC_DRV_MT6397 y
-  require_config KEYBOARD_MTK_PMIC y
-  require_config PWM_MEDIATEK y
-  require_config NVMEM_MTK_EFUSE y
-  require_config IIO_ST_LSM6DSX y
-  require_config AMZ_PRIVACY y
-  require_config LEDS_MT6323 y
-  require_config FILE_LOCKING y
-  require_config INOTIFY_USER y
-  require_config IP_MULTICAST y
-  require_config BLK_DEV_LOOP y
-  require_config SQUASHFS_LZ4 y
+  if [[ "$KERNEL_ARCH" == arm ]]; then
+    require_config USB_CONFIGFS_RNDIS y
+    require_config PINCTRL_MT8163 y
+    require_config MTK_MT8163_CONSYS y
+    require_config MTK_COMBO_WIFI y
+    require_config LEDS_CLASS_MULTICOLOR y
+    require_config LEDS_IS31FL32XX y
+    require_config MTK_MT8163_BLUEZ_HCI y
+    # Full-parity board closure: PMIC/reset/RTC/input/sensors/LEDs plus the
+    # feature-payload and discovery primitives used by production services.
+    require_config MFD_MT6397 y
+    require_config REGULATOR_MT6323 y
+    require_config POWER_RESET_MT6323 y
+    require_config RTC_DRV_MT6397 y
+    require_config KEYBOARD_MTK_PMIC y
+    require_config PWM_MEDIATEK y
+    require_config NVMEM_MTK_EFUSE y
+    require_config IIO_ST_LSM6DSX y
+    require_config AMZ_PRIVACY y
+    require_config LEDS_MT6323 y
+    require_config FILE_LOCKING y
+    require_config INOTIFY_USER y
+    require_config IP_MULTICAST y
+    require_config BLK_DEV_LOOP y
+    require_config SQUASHFS_LZ4 y
+  else
+    # MT8167 has no MT8163 WMT/consys glue; its USB gadget is cdc-acm/cdc-ncm
+    # over the MTU3/MUSB HDRC block.  Lidar has no PMIC behind the PMIC
+    # wrapper (its DTS keeps pwrap disabled; the rails are the RT5739 and
+    # fixed regulators), so the wrapper driver is not required.
+    require_config USB_CONFIGFS_ACM y
+    require_config USB_CONFIGFS_NCM y
+    require_config REGULATOR_RT5739 y
+    require_config MT7668_SDIO y
+    require_config BT_MTKSDIO y
+    require_config AMZ_PRIVACY y
+    require_config LEDS_IS31FL32XX y
+    require_config FILE_LOCKING y
+    require_config INOTIFY_USER y
+    require_config IP_MULTICAST y
+    require_config BLK_DEV_LOOP y
+    require_config SQUASHFS_LZ4 y
+  fi
 else
   require_config USB_CONFIGFS y
   require_config USB_CONFIGFS_F_FS y
 fi
-require_config AEABI y
-if grep -qxF 'CONFIG_USB_MTK_HDRC=y' "$KERNEL_OUT/.config"; then
-  require_config OABI_COMPAT y
+if [[ "$KERNEL_ARCH" == arm ]]; then
+  require_config AEABI y
+  if grep -qxF 'CONFIG_USB_MTK_HDRC=y' "$KERNEL_OUT/.config"; then
+    require_config OABI_COMPAT y
+  fi
 fi
 if (( recovery_marker_kconfig )); then
   if [[ "$IMAGE_PROFILE" == development ]]; then
@@ -969,6 +1006,7 @@ if (( recovery_marker_kconfig )); then
     exit 1
   fi
 fi
+if [[ "$KERNEL_ARCH" == arm ]]; then
 # The Amazon MT8163 machine moved from the vendor 3.18 symbol to the
 # 6.1 SPI/topology symbols.  Require both the machine and its transport.
 require_any_config y MT_SND_SOC_8163_AMZN SND_SOC_MT8163_RADAR_PUFFIN
@@ -1054,6 +1092,11 @@ if [[ -f "$radar_machine_source" && -f "$radar_codec_header" &&
   require_source_marker "$radar_afe_source" \
     'AFE_I06_TO_O04' 'DL1 right AFE route'
 fi
+else
+  # MT8516/Lidar: the machine driver and its AFE live under mt8167 symbols.
+  require_config SND_SOC_MT8516 y
+  require_config SND_SOC_MT8516_AMAZON_LIDAR y
+fi
 
 if grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config" &&
    grep -q '^CONFIG_USB_FUNCTIONFS=' "$KERNEL_OUT/.config"; then
@@ -1070,17 +1113,17 @@ kernel_build_epoch="$(git -C "$KERNEL_SRC" log -1 --format=%ct HEAD)"
 KBUILD_BUILD_USER=libreecho KBUILD_BUILD_HOST=libreecho KBUILD_BUILD_VERSION=1 \
 KBUILD_BUILD_TIMESTAMP="$(date -u -d "@$kernel_build_epoch" '+%a %b %e %H:%M:%S UTC %Y')" \
 make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH="$KERNEL_ARCH" CROSS_COMPILE="$KERNEL_CROSS" \
-  LD="${KERNEL_CROSS}ld.bfd" -j"$JOBS" "$KERNEL_IMAGE_NAME" "$KERNEL_DTB_NAME"
+  LD="${KERNEL_CROSS}ld.bfd" -j"$JOBS" "$KERNEL_IMAGE_NAME" "$KERNEL_DTB_TARGET"
 
 ZIMAGE_BUILD="$KERNEL_OUT/$KERNEL_BOOT_SUBDIR/$KERNEL_IMAGE_NAME"
 SYSMAP_BUILD="$KERNEL_OUT/System.map"
-KERNEL_DTB="$KERNEL_OUT/$KERNEL_BOOT_SUBDIR/dts/$KERNEL_DTB_NAME"
+KERNEL_DTB="$KERNEL_OUT/$KERNEL_DTS_SUBDIR/$KERNEL_DTB_NAME"
 [[ -f "$ZIMAGE_BUILD" && -f "$SYSMAP_BUILD" && -f "$KERNEL_DTB" ]] || {
   echo "ERROR: kernel or DTB outputs missing" >&2; exit 1;
 }
 DTB_VERIFIER="$TOOLS_DIR/verify_${DTB_VERIFIER_ID}_dtb.py"
 [[ -f "$DTB_VERIFIER" && ! -L "$DTB_VERIFIER" ]] || {
-  echo "ERROR: Radar-Puffin DTB verifier missing: $DTB_VERIFIER" >&2
+  echo "ERROR: target DTB verifier missing: $DTB_VERIFIER" >&2
   exit 1
 }
 python3 -B "$DTB_VERIFIER" --dtb "$KERNEL_DTB"
@@ -2369,6 +2412,12 @@ python3 -B "$BUILDER" "${TARGET_TOOL_ARGS[@]}" \
 bootsha="$(sha256sum "$RUN/boot.img" | awk '{print $1}')"
 echo "=== independent image verification ==="
 platform_args "$VERIFIER"
+connectivity_verifier_args=()
+if [[ "$KERNEL_ARCH" == arm ]]; then
+  # The MT8163 WMT/connectivity bundle has no MT8167 equivalent; Lidar Wi-Fi
+  # and Bluetooth are MT7668 over SDIO.
+  connectivity_verifier_args=(--expected-connectivity-bundle mt8163-v181-stock-v1)
+fi
 python3 -B "$VERIFIER" "${TARGET_TOOL_ARGS[@]}" \
   --boot-envelope "$BOOT_ENVELOPE" \
   --zimage "$RUN/$KERNEL_IMAGE_NAME" --expected-zimage-sha256 "$zsha" \
@@ -2397,7 +2446,7 @@ python3 -B "$VERIFIER" "${TARGET_TOOL_ARGS[@]}" \
   --expected-ui-manifest-sha256 "$ui_manifest_sha" \
   --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
   "${ssh_verifier_args[@]}" \
-  --expected-connectivity-bundle mt8163-v181-stock-v1 | tee "$RUN/verify.log"
+  "${connectivity_verifier_args[@]}" | tee "$RUN/verify.log"
 
 USERDATA_TREE=
 userdata_manifest_sha=

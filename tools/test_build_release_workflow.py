@@ -119,18 +119,29 @@ class Tests(unittest.TestCase):
     'libreecho-musl-toolchain-v1-',
     'libreecho-neural-deps-v1-',
     'libreecho-components-v6-',
-    'libreecho-kernel-out-v2-parity-radar_puffin-biscuit-',
+    'libreecho-kernel-out-v2-parity-',
+    'libreecho-aarch64-cross-v1-',
   ):
    self.assertIn(key, W)
+  # The kernel key is descriptor-derived: the literal target list is gone and
+  # the selected first target supplies arch/defconfig and the compiler bytes.
+  self.assertNotIn('parity-radar_puffin-biscuit-', W)
+  self.assertIn("\"${{ inputs.targets || 'radar_puffin' }}\"", W)
+  self.assertIn('build/ci/aarch64_toolchain.py fetch', W)
+  self.assertIn('build/inputs/aarch64-cross-toolchain.lock.json', W)
+  self.assertIn('LIBREECHO_AARCH64_CROSS', W)
   # The neural cache key binds the exact compiler bytes and the ARMHF root
   # package digest (any package added/removed/updated invalidates it).
   self.assertIn('steps.armhf-id.outputs.armhf_cc_sha256', W)
   self.assertIn('steps.armhf-pkg.outputs.armhf_root_digest', W)
   self.assertIn('needs.prepare-public-inputs.outputs.armhf_root_digest', W)
+  # An arm64 kernel key must bind the staged aarch64 root receipt, not only the
+  # gcc bytes, so a sysroot-only lock change cannot restore a stale object tree.
+  self.assertIn('needs.prepare-public-inputs.outputs.aarch64_root_digest', W)
   self.assertIn('linux-libc-dev-armhf-cross', W)
   # The kernel cache key binds kernel SHA, compiler bytes, and defconfig.
   self.assertIn('needs.resolve-and-preflight.outputs.linux_sha', W)
-  self.assertIn('mt8163_arm32_defconfig', W)
+  self.assertIn('arch/$KERNEL_ARCH/configs/$KERNEL_DEFCONFIG', W)
   # A cold kernel output generates defconfig automatically; a restored cache
   # must not pass --defconfig, which invalidates the object tree and rebuilds
   # the entire kernel despite a cache hit.
@@ -247,7 +258,8 @@ class Tests(unittest.TestCase):
   # The staged ARMHF binutils are dynamically linked against -armhf libs
   # inside the extracted root; the runner host lacks them, so the build
   # step must export LD_LIBRARY_PATH (host-bin too, for libfdt.so.1).
-  self.assertIn('LD_LIBRARY_PATH: ${{ runner.temp }}/armhf-root/usr/lib/x86_64-linux-gnu:${{ runner.temp }}/host-bin', W)
+  self.assertIn('LD_LIBRARY_PATH: ${{ runner.temp }}/armhf-root/usr/lib/x86_64-linux-gnu', W)
+  self.assertIn('${{ runner.temp }}/aarch64-root/usr/lib/x86_64-linux-gnu', W)
   self.assertIn('"$RUNNER_TEMP/armhf-root/usr/sbin"', W)
   self.assertIn('find "$RUNNER_TEMP/public-deps/host-tools/bin" -type f -exec chmod 0755 {} +', W)
   # Host build tools missing from the ubuntu-24.04 runner image are staged
