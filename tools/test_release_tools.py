@@ -2439,5 +2439,92 @@ class UserdataRegressionIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class DonorDerivedArtifactGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def artifact(self, name: str, data: bytes = b"clean release payload") -> Path:
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def test_accepts_a_clean_artifact(self) -> None:
+        PREPARE_RELEASE.reject_donor_derived_artifacts(
+            [self.artifact("ota.tar")])
+
+    def test_refuses_an_mtk_preloader_lk_or_tee_header_for_lidar(self) -> None:
+        path = self.artifact("boot.img", b"\x88\x16\x88\x58" + b"\0" * 60)
+        with self.assertRaises(SystemExit) as failure:
+            PREPARE_RELEASE.reject_donor_derived_artifacts(
+                [path], lidar_target=True)
+        self.assertIn("MTK preloader/LK/TEE header", str(failure.exception))
+
+    def test_refuses_an_emmc_boot_preloader_for_lidar(self) -> None:
+        path = self.artifact("preloader.bin", b"EMMC_BOOT" + b"\0" * 60)
+        with self.assertRaises(SystemExit) as failure:
+            PREPARE_RELEASE.reject_donor_derived_artifacts(
+                [path], lidar_target=True)
+        self.assertIn("eMMC boot preloader", str(failure.exception))
+
+    def test_radar_and_biscuit_mtk_shaped_assets_still_pass(self) -> None:
+        # Radar and Biscuit releases ship MTK-headed LK/boot and Amonet images.
+        for name, data in (
+            ("lk.img", b"\x88\x16\x88\x58\0\0\0\0LK\0" + b"\0" * 60),
+            ("boot.img", b"\x88\x16\x88\x58" + b"\0" * 60),
+            ("preloader.bin", b"EMMC_BOOT" + b"\0" * 60),
+        ):
+            with self.subTest(name=name):
+                path = self.artifact(name, data)
+                PREPARE_RELEASE.reject_donor_derived_artifacts([path])
+                PREPARE_RELEASE.reject_donor_derived_artifacts(
+                    [path], lidar_target=False)
+                with self.assertRaises(SystemExit):
+                    PREPARE_RELEASE.reject_donor_derived_artifacts(
+                        [path], lidar_target=True)
+
+    def test_refuses_gbl_by_extension_magic_and_name(self) -> None:
+        for name, data in (
+            ("radio.gbl", b"whatever"),
+            ("blob.bin", bytes.fromhex("eb17a603") + b"\0" * 60),
+            ("xncp-fw.bin", b"renamed radio image"),
+        ):
+            with self.subTest(name=name):
+                path = self.artifact(name, data)
+                with self.assertRaises(SystemExit):
+                    PREPARE_RELEASE.reject_donor_derived_artifacts([path])
+
+    def test_refuses_a_digest_from_the_generator_manifest(self) -> None:
+        payload = b"donor tail bytes"
+        path = self.artifact("payload.bin", payload)
+        manifest = self.root / "donor-artifacts.json"
+        manifest.write_text(json.dumps({
+            "schema": PREPARE_RELEASE.DONOR_MANIFEST_SCHEMA,
+            "artifacts": [{
+                "name": "tee1-stage.bin",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }],
+        }))
+        with self.assertRaises(SystemExit) as failure:
+            PREPARE_RELEASE.reject_donor_derived_artifacts(
+                [path], manifest)
+        self.assertIn("matches donor artifact", str(failure.exception))
+
+    def test_component_gate_cli_calls_the_shared_scan(self) -> None:
+        path = self.artifact("boot.img", b"\x88\x16\x88\x58" + b"\0" * 60)
+        result = subprocess.run([
+            sys.executable, str(ROOT / "tools/check-release-components.py"),
+            "--artifacts", str(path), "--target", "lidar",
+        ], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MTK preloader/LK/TEE header", result.stderr)
+        radar = subprocess.run([
+            sys.executable, str(ROOT / "tools/check-release-components.py"),
+            "--artifacts", str(path),
+        ], text=True, capture_output=True)
+        self.assertEqual(radar.returncode, 0, radar.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

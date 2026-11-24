@@ -355,6 +355,7 @@ Then add the target to:
 | `release/target.schema.json` | the new `target_id`, `release_slug`, fastboot product and `hw_profile` enums, plus an `allOf` identity block like the `biscuit` one |
 | `build/ci/target_registry.py` | `KNOWN_TARGETS` and the expected `(slug, products, hw_profile)` identity |
 | `build/ci/validate-targets.py`, `build/build.sh` | the default and usage target lists |
+| `tools/prepare-release.py`, `tools/check-release-components.py` | the new id in each `--target` choice list (`lidar` also turns on the MTK boot-chain signature rules) |
 | `.github/workflows/build-release.yml`, `.github/workflows/publish-release.yml` | the `targets` input description and the target choice list |
 | `release/amonet-pins.json` | the model's community amonet archive: name, size, SHA-256 and each reviewed LK build's payload |
 | `tools/libreecho-install.py` | `AMONET_PINS` (kept equal to `amonet-pins.json` by tests), `USERDATA_TARGET_BYTES`, `ADB_DEVICE_PROP`, `TARGET_INDEX`; then regenerate `tools/libreecho-install.py.sha256` |
