@@ -7,11 +7,15 @@ on:
       - 'tools/prepare-release.py'
       - 'build/ci/prepare-stable-release.py'
       - 'build/ci/ota_v2_product.py'
+      - 'build/ci/target_registry.py'
+      - 'build/ci/validate-targets.py'
       - 'build/ci/validate-stable-publisher.py'
       - 'build/ci/publish-stable-release.sh'
       - 'build/ci/generate-release-notes.py'
       - 'build/tests/test_release_packaging.py'
       - 'build/tests/test_ota_v2_complete_gate.py'
+      - 'build/tests/test_multi_target.py'
+      - 'build/tests/test_target_manifest.py'
       - 'build/tests/test_generate_release_notes.py'
       - 'tools/prepare-sbom.py'
       - 'tools/check-release-components.py'
@@ -42,11 +46,15 @@ on:
       - 'tools/prepare-release.py'
       - 'build/ci/prepare-stable-release.py'
       - 'build/ci/ota_v2_product.py'
+      - 'build/ci/target_registry.py'
+      - 'build/ci/validate-targets.py'
       - 'build/ci/validate-stable-publisher.py'
       - 'build/ci/publish-stable-release.sh'
       - 'build/ci/generate-release-notes.py'
       - 'build/tests/test_release_packaging.py'
       - 'build/tests/test_ota_v2_complete_gate.py'
+      - 'build/tests/test_multi_target.py'
+      - 'build/tests/test_target_manifest.py'
       - 'build/tests/test_generate_release_notes.py'
       - 'tools/prepare-sbom.py'
       - 'tools/check-release-components.py'
@@ -71,6 +79,12 @@ on:
       - '.github/workflows/publish-release.yml'
       - '.github/workflows/publish-news.yml'
   workflow_dispatch:
+    inputs:
+      platform_ref:
+        description: LibreEcho-Platform branch that provides the target OTA tools
+        required: false
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -131,3 +145,53 @@ jobs:
         run: python -B -m unittest tools.test_oneshot_host_preflight -v
       - name: Verify installer setup reconnect after device reboot
         run: python -B -m unittest tools.test_installer_setup_reconnect -v
+
+  target-contracts:
+    name: Target descriptors and multi-target contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - name: Check out Platform target tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ${{ github.repository_owner }}/LibreEcho-Platform
+          ref: ${{ inputs.platform_ref || 'main' }}
+          path: platform-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install reviewed gate dependencies
+        run: |
+          set -euo pipefail
+          wheelhouse="$GITHUB_WORKSPACE/build/inputs/reviewed/python-wheels"
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-index \
+            --find-links "$wheelhouse" \
+            --require-hashes \
+            --requirement "$wheelhouse/requirements.txt"
+      - name: Fetch legacy generator commit for the Radar parity test
+        run: |
+          set -euo pipefail
+          # The multi-target suite compares the current Radar generator with
+          # the pinned legacy baseline; the shallow checkout lacks that commit.
+          git fetch --no-tags --depth=1 origin c48fe070f38bd2c974257656961918254848758b
+          git cat-file -e c48fe070f38bd2c974257656961918254848758b^{commit}
+      - name: Validate every target descriptor
+        run: |
+          set -euo pipefail
+          for target in radar_puffin biscuit lidar; do
+            python3 build/ci/validate-targets.py --targets "$target"
+          done
+      - name: Run the target and multi-target contract suites
+        env:
+          LIBREECHO_PLATFORM_SRC: ${{ github.workspace }}/platform-source
+          LIBREECHO_PLATFORM_SOURCE: ${{ github.workspace }}/platform-source
+        run: |
+          python -B -m unittest -v \
+            build.tests.test_multi_target \
+            build.tests.test_target_manifest
