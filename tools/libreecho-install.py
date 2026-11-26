@@ -223,7 +223,7 @@ LK_EXT_MAGIC = 0x58891689
 LK_HEADER_MIN = 80
 LK_HEADER_DEFAULT = 512
 LK_ALIGNMENT = 8
-# Platform AGENTS.md:84-88 ("Boot-chain safety" rule 2) requires the chain
+# Platform AGENTS.md, "Boot-chain safety" rule 2, requires the chain
 # generation to be established before any flash write. On the amonet v2.0.0
 # chain expdb[0:16] starts with the MTK image header of the Kaeru LK-stage
 # payload; an ASCII FASTBOOT_PLEASE marker there means the chain is broken.
