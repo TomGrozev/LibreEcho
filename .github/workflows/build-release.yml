@@ -325,6 +325,7 @@ jobs:
             build.tests.test_publish_dev_pointer \
             build.tests.test_publish_v3_pointer \
             build.tests.test_target_manifest \
+            build.tests.test_target_descriptor_tools_profile \
             build.tests.test_ota_v3_release \
             build.tests.test_ota_v2_signing \
             build.tests.test_ota_v2_complete_gate \

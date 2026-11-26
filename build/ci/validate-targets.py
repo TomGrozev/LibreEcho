@@ -23,6 +23,8 @@ try:
             print('KERNEL_ARCH=' + {'arm32': 'arm', 'arm64': 'arm64'}[d['arch']])
             print('DTB_VERIFIER_ID=' + d['platform']['dtb_verifier'])
             print('TOOLS_PROFILE=' + d['platform']['tools_profile'])
+            print('USERSPACE_TOOLS_PROFILE=' + d['platform'].get(
+                'userspace_tools_profile', d['platform']['tools_profile']))
         else:
             print(json.dumps({'board': target, 'target_descriptor_sha256': digest}, sort_keys=True))
 except ValueError as exc:

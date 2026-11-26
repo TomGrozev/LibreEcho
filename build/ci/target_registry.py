@@ -84,6 +84,17 @@ def load_target(target=DEFAULT):
     return validate_descriptor(json.loads(path.read_text()), target)
 
 
+def userspace_tools_profile(target=DEFAULT):
+    """The tools tree that builds this target's ARM32 userspace components.
+
+    Image tools live under ``tools_profile``; a target whose userspace still
+    runs the shared ARM32 stack names that tree separately, because its image
+    tools cannot build those components.
+    """
+    platform = load_target(target)["platform"]
+    return platform.get("userspace_tools_profile", platform["tools_profile"])
+
+
 def hardware_accepted(target=DEFAULT):
     """The target descriptor's hardware-acceptance decision; builds copy it."""
     return load_target(target)["hardware_accepted"] is True

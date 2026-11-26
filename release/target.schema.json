@@ -126,6 +126,13 @@
             "mt8167-arm64"
           ]
         },
+        "userspace_tools_profile": {
+          "type": "string",
+          "enum": [
+            "mt8163-arm32",
+            "mt8167-arm64"
+          ]
+        },
         "dtb_verifier": {
           "enum": [
             "radar_puffin",
@@ -316,9 +323,15 @@
           },
           "platform": {
             "type": "object",
+            "required": [
+              "userspace_tools_profile"
+            ],
             "properties": {
               "tools_profile": {
                 "const": "mt8167-arm64"
+              },
+              "userspace_tools_profile": {
+                "const": "mt8163-arm32"
               },
               "dtb_verifier": {
                 "const": "lidar"

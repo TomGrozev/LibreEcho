@@ -25,6 +25,7 @@
   ],
   "platform": {
     "tools_profile": "mt8167-arm64",
+    "userspace_tools_profile": "mt8163-arm32",
     "dtb_verifier": "lidar",
     "hw_profile": "lidar@1"
   }
