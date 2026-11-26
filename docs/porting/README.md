@@ -357,6 +357,7 @@ Then add the target to:
 | `build/ci/validate-targets.py`, `build/build.sh` | the default and usage target lists |
 | `tools/prepare-release.py`, `tools/check-release-components.py` | the new id in each `--target` choice list (`lidar` also turns on the MTK boot-chain signature rules) |
 | `.github/workflows/build-release.yml`, `.github/workflows/publish-release.yml` | the `targets` input description and the target choice list |
+| `.github/workflows/release-gate.yml` | the target list in the `target-contracts` job's descriptor loop |
 | `release/amonet-pins.json` | the model's community amonet archive: name, size, SHA-256 and each reviewed LK build's payload |
 | `tools/libreecho-install.py` | `AMONET_PINS` (kept equal to `amonet-pins.json` by tests), `USERDATA_TARGET_BYTES`, `ADB_DEVICE_PROP`, `TARGET_INDEX`; then regenerate `tools/libreecho-install.py.sha256` |
 | `tools/run-one-shot.sh` | the board, recovery and fastboot product matches, and the slug |
