@@ -135,14 +135,9 @@ TTS_NORTHERN_MALE_MODEL="${LIBREECHO_TTS_NORTHERN_MALE_MODEL:-}"
 TTS_FEMALE_MODEL="${LIBREECHO_TTS_FEMALE_MODEL:-}"
 TTS_TOKENS="${LIBREECHO_TTS_TOKENS:-}"
 TTS_ESPEAK_DATA="${LIBREECHO_TTS_ESPEAK_DATA:-}"
-WAKE_ORT_SOURCE="${LIBREECHO_WAKE_ORT_SOURCE:-}"
 WAKE_FLATBUFFERS_PYTHON=
-WAKE_ORT_BUILD="${LIBREECHO_WAKE_ORT_BUILD:-$GENERATED_ROOT/onnxruntime-wake-reduced}"
-WAKE_SPEEX_PREFIX="${LIBREECHO_WAKE_SPEEX_PREFIX:-$GENERATED_ROOT/speexdsp-arm32}"
+WAKE_SPEEX_PREFIX=
 WAKE_SPEEX_ARCHIVE="$INPUTS/speexdsp-SpeexDSP-1.2.1.tar.gz"
-WAKE_MEL_MODEL="$INPUTS/melspectrogram.onnx"
-WAKE_EMBEDDING_MODEL="$INPUTS/embedding_model.onnx"
-WAKE_CLASSIFIER_MODEL="$INPUTS/alexa_v0.1.onnx"
 WAKE_TFLM_SOURCE="${LIBREECHO_WAKE_TFLM_SOURCE:-$INPUTS/tflite-micro-source}"
 WAKE_TFLM_FLATBUFFERS_SOURCE="${LIBREECHO_WAKE_TFLM_FLATBUFFERS_SOURCE:-$INPUTS/flatbuffers-source}"
 WAKE_TFLM_KISSFFT_SOURCE="${LIBREECHO_WAKE_TFLM_KISSFFT_SOURCE:-$INPUTS/kissfft-source}"
@@ -522,15 +517,8 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
     exit 1
   }
   if [[ "$WAKEWORD_ENABLED" == 1 ]]; then
-    for wake_input in "$WAKE_SPEEX_ARCHIVE" "$WAKE_MEL_MODEL" \
-        "$WAKE_EMBEDDING_MODEL" "$WAKE_CLASSIFIER_MODEL"; do
-      [[ -f "$wake_input" && ! -L "$wake_input" ]] || {
-        echo "ERROR: missing reviewed wakeword input: $wake_input" >&2
-        exit 1
-      }
-    done
-    [[ -d "$WAKE_ORT_SOURCE/.git" ]] || {
-      echo "ERROR: missing pinned ONNX Runtime source: $WAKE_ORT_SOURCE" >&2
+    [[ -f "$WAKE_SPEEX_ARCHIVE" && ! -L "$WAKE_SPEEX_ARCHIVE" ]] || {
+      echo "ERROR: missing reviewed wakeword input: $WAKE_SPEEX_ARCHIVE" >&2
       exit 1
     }
     for wake_tflm_dir in "$WAKE_TFLM_SOURCE" "$WAKE_TFLM_FLATBUFFERS_SOURCE" \
@@ -1591,158 +1579,21 @@ if [[ "$WAKEWORD_ENABLED" == 1 ]]; then
     exit 1
   }
 
-  echo "=== restoring or building reduced ARM32 wakeword dependencies ==="
-  WAKE_RUNTIME_BUILDER="$TOOLS_DIR/wakeword/build_runtime.sh"
-  [[ -x "$WAKE_RUNTIME_BUILDER" ]] || {
-    echo "ERROR: wakeword runtime builder is missing: $WAKE_RUNTIME_BUILDER" >&2
+  echo "=== building static ARM32 microWakeWord daemon ==="
+  # The daemon links the TFLM archives staged above plus the shared ARM
+  # speexdsp prefix the TTS and STT daemons already use.
+  WAKE_SPEEX_PREFIX="$SPEEX_PREFIX"
+  make -C "$UI_SOURCE" CROSS_COMPILE="$UI_CROSS" CC=gcc \
+    ARM_SPEEX_PREFIX="$WAKE_SPEEX_PREFIX" \
+    WAKE_TFLM_INCLUDE="$WAKE_TFLM_INCLUDE" \
+    WAKE_TFLM_LIB="$WAKE_TFLM_LIB" \
+    WAKE_TFLM_FRONTEND_LIB="$WAKE_TFLM_FRONTEND_LIB" \
+    build/libreecho-waked-mww-arm32 | tee "$RUN/wakeword-daemon-build.log"
+  WAKE_DAEMON="$UI_SOURCE/build/libreecho-waked-mww-arm32"
+  [[ -f "$WAKE_DAEMON" && ! -L "$WAKE_DAEMON" ]] || {
+    echo "ERROR: microWakeWord daemon build did not produce the binary" >&2
     exit 1
   }
-  wake_ort_head="$(git -C "$WAKE_ORT_SOURCE" rev-parse HEAD)"
-  wake_ort_diff="$(source_state_sha256 "$WAKE_ORT_SOURCE")"
-  wake_ort_cache_key="$(component_cache_key wake-ort \
-    --value "contract=reduced-static-archives-v7-pinned-ort-closure" \
-    --value "jobs=$JOBS" --value "ui_toolchain=$UI_TOOLCHAIN_KEY" \
-    --value "ort_head=$wake_ort_head" --value "ort_diff=$wake_ort_diff" \
-    --tree "platform-wakeword=$TOOLS_DIR/wakeword" \
-    --tree "flatbuffers-python=$WAKE_FLATBUFFERS_PYTHON" \
-    --file "operators-config=$TOOLS_DIR/wakeword/required_operators.config" \
-    --file "mel-model=$WAKE_MEL_MODEL" --file "embedding-model=$WAKE_EMBEDDING_MODEL" \
-    --file "classifier-model=$WAKE_CLASSIFIER_MODEL" \
-    --file "host-cmake=$(command -v cmake)" --file "host-make=$(command -v make)" \
-    --file "host-python=$(command -v python3)" --file "host-autoconf=$(command -v autoconf)" \
-    --file "host-automake=$(command -v automake)" \
-    --file "host-libtoolize=$(command -v libtoolize)" \
-    --file "host-flock=$(command -v flock)")"
-  wake_runtime_cache_key="$(component_cache_key wake-runtime \
-    --value "contract=daemon-relink-speex-v2" --value "wake_ort=$wake_ort_cache_key" \
-    --value "jobs=$JOBS" --value "ui_toolchain=$UI_TOOLCHAIN_KEY" \
-    --value "ui_head=$ui_commit" --value "ui_diff=$ui_diff_sha" \
-    --tree "platform-wakeword=$TOOLS_DIR/wakeword" \
-    --tree "flatbuffers-python=$WAKE_FLATBUFFERS_PYTHON" \
-    --file "speex-source=$WAKE_SPEEX_ARCHIVE" --file "re2-archive=$ORT_PREFIX/lib/libre2.a" \
-    --file "ui-makefile=$UI_SOURCE/Makefile" \
-    --file "operators-config=$TOOLS_DIR/wakeword/required_operators.config" \
-    --file "mel-model=$WAKE_MEL_MODEL" --file "embedding-model=$WAKE_EMBEDDING_MODEL" \
-    --file "classifier-model=$WAKE_CLASSIFIER_MODEL" \
-    --file "host-cmake=$(command -v cmake)" --file "host-make=$(command -v make)" \
-    --file "host-python=$(command -v python3)" --file "host-autoconf=$(command -v autoconf)" \
-    --file "host-automake=$(command -v automake)" \
-    --file "host-libtoolize=$(command -v libtoolize)" \
-    --file "host-flock=$(command -v flock)")"
-
-  WAKE_ORT_WORK="$RUN/wake-ort-working"
-  WAKE_RUNTIME_STAGE="$RUN/wake-runtime-stage"
-  WAKE_BUILD_ROOT="$RUN/wake-runtime-build"
-  rm -rf "$WAKE_ORT_WORK" "$WAKE_RUNTIME_STAGE" "$WAKE_BUILD_ROOT" \
-    "$RUN/components/wake-ort" "$RUN/components/wake-runtime"
-  wake_ort_status=rebuilt
-  wake_ort_ready=0
-  if component_cache_restore wake-ort "$wake_ort_cache_key" "$WAKE_ORT_WORK"; then
-    wake_ort_status=hit
-    wake_ort_ready=1
-  fi
-
-  wake_runtime_status=rebuilt
-  wake_runtime_ready=0
-  if [[ "$wake_ort_ready" == 1 ]] && \
-      component_cache_restore wake-runtime "$wake_runtime_cache_key" "$WAKE_RUNTIME_STAGE"; then
-    wake_runtime_status=hit
-    wake_runtime_ready=1
-    printf 'component_cache_hit=wake-runtime\n' >"$RUN/wakeword-daemon-build.log"
-  fi
-
-  if [[ "$wake_runtime_ready" != 1 ]]; then
-    mkdir -p "$WAKE_BUILD_ROOT/wakeword"
-    if [[ "$wake_ort_ready" == 1 ]]; then
-      WAKE_ORT_BUILD="$WAKE_ORT_WORK"
-    else
-      WAKE_ORT_BUILD="$WAKE_BUILD_ROOT/onnxruntime-wake-reduced"
-    fi
-    WAKE_SPEEX_BUILD="$WAKE_BUILD_ROOT/speexdsp-arm32"
-    WAKE_DAEMON_BUILD="$WAKE_BUILD_ROOT/wakeword/libreecho-waked"
-    LIBREECHO_WAKE_CROSS="$UI_CROSS" JOBS="$JOBS" \
-      LIBREECHO_WAKE_FLATBUFFERS_PYTHON="$WAKE_FLATBUFFERS_PYTHON" \
-      LIBREECHO_WAKE_RE2_ARCHIVE="$ORT_PREFIX/lib/libre2.a" \
-      LIBREECHO_WAKE_RELINK_OUTPUT="$WAKE_BUILD_ROOT/wakeword/relink" \
-      "$WAKE_RUNTIME_BUILDER" "$UI_SOURCE" "$WAKE_ORT_SOURCE" \
-      "$WAKE_ORT_BUILD" "$WAKE_SPEEX_ARCHIVE" "$WAKE_SPEEX_BUILD" \
-      "$WAKE_DAEMON_BUILD" | tee "$RUN/wakeword-daemon-build.log"
-    [[ -f "$WAKE_DAEMON_BUILD" && ! -L "$WAKE_DAEMON_BUILD" ]] || {
-      echo "ERROR: wakeword runtime build did not produce the daemon" >&2
-      exit 1
-    }
-
-    mkdir -p "$WAKE_RUNTIME_STAGE/wakeword"
-    cp -a -- "$WAKE_BUILD_ROOT/wakeword/." "$WAKE_RUNTIME_STAGE/wakeword/"
-    cp -a -- "$WAKE_SPEEX_BUILD" "$WAKE_RUNTIME_STAGE/speex-prefix"
-    require_relink_tree "$WAKE_RUNTIME_STAGE/wakeword/relink" "wakeword"
-    component_cache_store wake-runtime "$wake_runtime_cache_key" "$WAKE_RUNTIME_STAGE"
-
-    if [[ "$wake_ort_ready" != 1 ]]; then
-      mkdir -p "$WAKE_ORT_WORK"
-      for archive in \
-          libonnxruntime_session.a libonnxruntime_optimizer.a \
-          libonnxruntime_providers.a libonnxruntime_graph.a \
-          libonnxruntime_framework.a libonnxruntime_common.a \
-          libonnxruntime_mlas.a libonnxruntime_util.a \
-          libonnxruntime_flatbuffers.a libonnxruntime_lora.a; do
-        [[ -f "$WAKE_ORT_BUILD/$archive" && ! -L "$WAKE_ORT_BUILD/$archive" ]] || {
-          echo "ERROR: reduced ONNX Runtime archive is missing: $archive" >&2
-          exit 1
-        }
-        install -m 0644 "$WAKE_ORT_BUILD/$archive" "$WAKE_ORT_WORK/$archive"
-      done
-      # The wakeword daemon relink also consumes the reduced ORT dependency
-      # archives (onnx, protobuf-lite, flatbuffers, and Abseil). Pinned ORT
-      # 8f0278c7 has no nsync target. Required dependencies must be
-      # part of the cached wake-ort payload; otherwise a wake-ort cache hit
-      # combined with a wake-runtime cache miss relinks against an incomplete
-      # tree.
-      for dep_archive in \
-          _deps/onnx-build/libonnx.a \
-          _deps/onnx-build/libonnx_proto.a \
-          _deps/protobuf-build/libprotobuf-lite.a \
-          _deps/flatbuffers-build/libflatbuffers.a; do
-        [[ -f "$WAKE_ORT_BUILD/$dep_archive" && \
-           ! -L "$WAKE_ORT_BUILD/$dep_archive" ]] || {
-          echo "ERROR: reduced ONNX Runtime dependency archive is missing: $dep_archive" >&2
-          exit 1
-        }
-        mkdir -p "$WAKE_ORT_WORK/$(dirname -- "$dep_archive")"
-        install -m 0644 "$WAKE_ORT_BUILD/$dep_archive" \
-          "$WAKE_ORT_WORK/$dep_archive"
-      done
-      absl_count=0
-      while IFS= read -r -d '' absl_archive; do
-        relative=${absl_archive#"$WAKE_ORT_BUILD/"}
-        mkdir -p "$WAKE_ORT_WORK/$(dirname -- "$relative")"
-        install -m 0644 "$absl_archive" "$WAKE_ORT_WORK/$relative"
-        absl_count=$((absl_count + 1))
-      done < <(find "$WAKE_ORT_BUILD/_deps/abseil_cpp-build" -type f -name '*.a' -print0 | LC_ALL=C sort -z)
-      ((absl_count > 0)) || {
-        echo "ERROR: reduced ONNX Runtime Abseil closure is missing" >&2
-        exit 1
-      }
-      component_cache_store wake-ort "$wake_ort_cache_key" "$WAKE_ORT_WORK"
-    else
-      rm -f -- "$WAKE_ORT_WORK/.onnxruntime-source" "$WAKE_ORT_WORK/provider-symbols.txt"
-    fi
-  fi
-
-  component_materialize wake-ort "$wake_ort_cache_key" "$wake_ort_status" \
-    "$WAKE_ORT_WORK" "$RUN/components/wake-ort"
-  component_materialize wake-runtime "$wake_runtime_cache_key" "$wake_runtime_status" \
-    "$WAKE_RUNTIME_STAGE" "$RUN/components/wake-runtime"
-  rm -rf "$WAKE_ORT_WORK" "$WAKE_RUNTIME_STAGE" "$WAKE_BUILD_ROOT"
-  WAKE_ORT_BUILD="$RUN/components/wake-ort"
-  WAKE_SPEEX_PREFIX="$RUN/components/wake-runtime/speex-prefix"
-  WAKE_DAEMON="$RUN/components/wake-runtime/wakeword/libreecho-waked"
-  [[ -f "$WAKE_DAEMON" && ! -L "$WAKE_DAEMON" && \
-     -d "$RUN/components/wake-runtime/wakeword/relink" ]] || {
-    echo "ERROR: materialized wakeword runtime is incomplete" >&2
-    exit 1
-  }
-  require_relink_tree "$RUN/components/wake-runtime/wakeword/relink" "wakeword"
 fi
 
 echo "=== building static ARM32 English streaming STT daemon ==="
@@ -2154,32 +2005,35 @@ echo "tts_payload_size=$tts_payload_size"
 echo "tts_feature_manifest_sha256=$tts_feature_manifest_sha"
 
 if [[ "$WAKEWORD_ENABLED" == 1 ]]; then
-  echo "=== packaging openWakeWord as an external feature payload ==="
-WAKE_FEATURE_PACKAGER="$TOOLS_DIR/wakeword/package_feature.sh"
-[[ -x "$WAKE_FEATURE_PACKAGER" ]] || {
-  echo "ERROR: wakeword feature packager is missing: $WAKE_FEATURE_PACKAGER" >&2
-  exit 1
-}
-WAKE_PAYLOAD="$RUN/features/wakeword.squashfs"
-WAKE_FEATURE_MANIFEST="$RUN/features/wakeword.manifest.json"
-if [[ -n "$WAKEWORD_PAYLOAD_OVERRIDE" || -n "$WAKEWORD_MANIFEST_OVERRIDE" ]]; then
-  adopt_feature_payload wakeword "$WAKEWORD_PAYLOAD_OVERRIDE" "$WAKEWORD_MANIFEST_OVERRIDE" \
-    "$WAKE_PAYLOAD" "$WAKE_FEATURE_MANIFEST" | tee "$RUN/wakeword-feature-build.log"
-else
-  "$WAKE_FEATURE_PACKAGER" "$WAKE_DAEMON" "$WAKE_MEL_MODEL" \
-    "$WAKE_EMBEDDING_MODEL" "$WAKE_CLASSIFIER_MODEL" \
-    "$WAKE_PAYLOAD" "$WAKE_FEATURE_MANIFEST" | tee "$RUN/wakeword-feature-build.log"
-fi
-[[ -f "$WAKE_PAYLOAD" && -f "$WAKE_FEATURE_MANIFEST" ]] || {
-  echo "ERROR: wakeword feature payload package is incomplete" >&2
-  exit 1
-}
-wake_payload_sha="$(sha256sum "$WAKE_PAYLOAD" | awk '{print $1}')"
-wake_payload_size="$(stat -c %s "$WAKE_PAYLOAD")"
-wake_feature_manifest_sha="$(sha256sum "$WAKE_FEATURE_MANIFEST" | awk '{print $1}')"
-echo "wakeword_payload_sha256=$wake_payload_sha"
-echo "wakeword_payload_size=$wake_payload_size"
-echo "wakeword_feature_manifest_sha256=$wake_feature_manifest_sha"
+  echo "=== packaging microWakeWord as an external feature payload ==="
+  [[ -n "${WAKE_MWW_MODELS:-}" && -d "$WAKE_MWW_MODELS" && ! -L "$WAKE_MWW_MODELS" ]] || {
+    echo "ERROR: microWakeWord models root is unset or not a directory: ${WAKE_MWW_MODELS:-<unset>}" >&2
+    exit 1
+  }
+  WAKE_FEATURE_PACKAGER="$TOOLS_DIR/wakeword/package_feature.sh"
+  [[ -x "$WAKE_FEATURE_PACKAGER" ]] || {
+    echo "ERROR: wakeword feature packager is missing: $WAKE_FEATURE_PACKAGER" >&2
+    exit 1
+  }
+  WAKE_PAYLOAD="$RUN/features/wakeword.squashfs"
+  WAKE_FEATURE_MANIFEST="$RUN/features/wakeword.manifest.json"
+  if [[ -n "$WAKEWORD_PAYLOAD_OVERRIDE" || -n "$WAKEWORD_MANIFEST_OVERRIDE" ]]; then
+    adopt_feature_payload wakeword "$WAKEWORD_PAYLOAD_OVERRIDE" "$WAKEWORD_MANIFEST_OVERRIDE" \
+      "$WAKE_PAYLOAD" "$WAKE_FEATURE_MANIFEST" | tee "$RUN/wakeword-feature-build.log"
+  else
+    "$WAKE_FEATURE_PACKAGER" "$WAKE_DAEMON" "$WAKE_MWW_MODELS" \
+      "$WAKE_PAYLOAD" "$WAKE_FEATURE_MANIFEST" | tee "$RUN/wakeword-feature-build.log"
+  fi
+  [[ -f "$WAKE_PAYLOAD" && -f "$WAKE_FEATURE_MANIFEST" ]] || {
+    echo "ERROR: wakeword feature payload package is incomplete" >&2
+    exit 1
+  }
+  wake_payload_sha="$(sha256sum "$WAKE_PAYLOAD" | awk '{print $1}')"
+  wake_payload_size="$(stat -c %s "$WAKE_PAYLOAD")"
+  wake_feature_manifest_sha="$(sha256sum "$WAKE_FEATURE_MANIFEST" | awk '{print $1}')"
+  echo "wakeword_payload_sha256=$wake_payload_sha"
+  echo "wakeword_payload_size=$wake_payload_size"
+  echo "wakeword_feature_manifest_sha256=$wake_feature_manifest_sha"
 fi
 
 echo "=== packaging English streaming STT as an external feature payload ==="
@@ -2542,7 +2396,7 @@ if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
     "$SOURCE_OFFER_RELINK_ROOT/onnxruntime" \
     "$SOURCE_OFFER_RELINK_ROOT/onnxruntime-build" \
     "$SOURCE_OFFER_RELINK_ROOT/flite-root" "$SOURCE_OFFER_RELINK_ROOT/speexdsp" \
-    "$WAKE_ORT_BUILD" "$WAKE_SPEEX_PREFIX" \
+    "$WAKE_TFLM_PREFIX" "$WAKE_SPEEX_PREFIX" \
     "$SOURCE_OFFER_RELINK_ROOT/core-runtime-root" \
     "$SOURCE_OFFER_RELINK_ROOT/gcc-runtime" \
     "$FEATURE_POLICY" \

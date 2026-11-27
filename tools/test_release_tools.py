@@ -1140,7 +1140,8 @@ class ComponentGateTests(unittest.TestCase):
         self.assertEqual(
             wakeword["allowed_release_scopes"], ["community-noncommercial"]
         )
-        self.assertEqual(wakeword["use_restriction"], "noncommercial-model-asset")
+        self.assertIn("Apache-2.0", wakeword["license"])
+        self.assertNotIn("CC-BY-NC", wakeword["license"])
         audio = next(c for c in data["components"] if c["id"] == "mt8163-audio-fpga")
         self.assertEqual(audio["license"], "NOASSERTION")
         self.assertEqual(audio["release_status"], "documented-good-faith")
@@ -1272,6 +1273,8 @@ class ComponentGateTests(unittest.TestCase):
             wakeword = next(c for c in components if c["id"] == "wakeword-payload")
             wakeword["distribution_scope"] = "separate-payload"
             wakeword["release_status"] = "cleared"
+            wakeword["license"] = "CC-BY-NC-SA-4.0"
+            wakeword["use_restriction"] = "noncommercial-model-asset"
             wakeword["allowed_release_scopes"] = ["commercially-unrestricted"]
         message = self._catalog_failure(mutate)
         self.assertIn("noncommercial component has unsafe release scopes", message)
@@ -1387,7 +1390,7 @@ class ComponentGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("package_count=20", result.stdout)
         self.assertIn(
-            "openWakeWord runtime and pretrained Alexa-compatible model", names
+            "microWakeWord runtime and pretrained wake-word models", names
         )
 
     def test_component_gate_rejects_unresolved_redistributed_source_offer(self) -> None:

@@ -180,8 +180,8 @@ Verified in this repository (host only):
   runtime round kernels differently; the model inputs are byte-identical at
   those steps.
 - The store and validator tests cover a valid model, a disallowed operator,
-  wrong tensor types, a missing manifest field, an arena over the cap, a
-  leftover ONNX model and the folder rules above.
+  wrong tensor types, a missing manifest field, an arena over the cap and the
+  folder rules above.
 - The web picker, the API and the init script tests pass with the new file
   set.
 

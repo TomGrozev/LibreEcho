@@ -43,22 +43,19 @@ Total sidecar-listed members independently verified: **3,238**.
 | Assistant | `55e7ef2a927221b026e260cf5a1656a42bb13cf8d0725f8b56b9cdaee19a8f47` | 2,981,888 |
 
 The image and userdata manifests require all five payloads. The wakeword
-packager separately enforces the reviewed model identities:
+packager separately enforces the reviewed microWakeWord model identities pinned
+in `build/inputs/public-inputs.json` (`alexa`, `okay_nabu`, `hey_jarvis`,
+`hey_mycroft`, and `vad`).
 
-- `melspectrogram.onnx`: `ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f`
-- `embedding_model.onnx`: `70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f`
-- `alexa_v0.1.onnx`: `6ff566a01d12670e8d9e3c59da32651db1575d17272a601b7f8a39283dfbae3e`
-
-It also requires and embeds `MODEL-LICENSE.txt`, the complete
-`CC-BY-NC-SA-4.0.txt`, and the runtime licence bundle.
+It also requires and embeds the upstream Apache-2.0 `LICENSE` and `NOTICE`
+files and the runtime licence bundle.
 
 ## Distribution boundary
 
-The wakeword model is cleared only for the explicitly labelled
-`community-noncommercial` scope. Recipients must preserve attribution and the
-full licence, indicate modifications, use the model only as permitted by the
-NonCommercial condition, and apply ShareAlike to adaptations. This record does
-not authorize unrestricted commercial distribution.
+The wakeword payload is cleared only for the explicitly labelled
+`community-noncommercial` scope until it and its source offer are rebuilt for
+the microWakeWord engine. The models and runtime are Apache-2.0; recipients
+must preserve the upstream attribution and the runtime notices.
 
 The probe did not alter canonical `out/CURRENT` and was not published, flashed,
 booted, OTA-installed, runtime-tested, or slot-confirmed.

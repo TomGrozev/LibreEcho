@@ -35,8 +35,9 @@ builds static ARM32 ONNX Runtime and Sherpa libraries, retains the FlatBuffers
 Python generator tree, builds RE2 and SpeexDSP, and writes only the generated
 roots under the job-local `public-deps/neural/` directory. The mature builder
 receives those roots explicitly; it never discovers or imports a private neural
-cache. The reduced wakeword ONNX Runtime build remains a separate run-local
-step performed by the mature builder from the same pinned ONNX Runtime source.
+cache. The microWakeWord runtime is a separate run-local step: the mature
+builder compiles TFLite Micro and its frontend from the pinned sources, then
+links the wake daemon against those archives.
 
 ## Issuing a stable release
 

@@ -1289,7 +1289,6 @@ jobs:
           LIBREECHO_TTS_FEMALE_MODEL: ${{ runner.temp }}/public-deps/southern-female.derived.onnx
           LIBREECHO_TTS_TOKENS: ${{ runner.temp }}/public-deps/tts-tokens.txt
           LIBREECHO_STT_MODEL_ROOT: ${{ runner.temp }}/public-deps
-          LIBREECHO_WAKE_ORT_SOURCE: ${{ runner.temp }}/public-deps/onnxruntime-source
           LIBREECHO_WAKE_TFLM_SOURCE: ${{ runner.temp }}/public-deps/tflite-micro-source
           LIBREECHO_WAKE_TFLM_FLATBUFFERS_SOURCE: ${{ runner.temp }}/public-deps/flatbuffers-source
           LIBREECHO_WAKE_TFLM_KISSFFT_SOURCE: ${{ runner.temp }}/public-deps/kissfft-source

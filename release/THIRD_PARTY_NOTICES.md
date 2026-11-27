@@ -76,8 +76,9 @@ be treated as a new release decision.
 
 The following SquashFS files are independent release assets. Each must be
 cleared for the selected release scope, preserve its own license conditions,
-and pass the exact source-offer gate before release. The wakeword asset is
-allowed only in the explicitly labelled `community-noncommercial` scope.
+and pass the exact source-offer gate before release. The wakeword asset remains
+scoped to the explicitly labelled `community-noncommercial` profile until its
+payload and source offer are rebuilt for the microWakeWord engine.
 
 ### AirPlay 2
 
@@ -124,11 +125,12 @@ because its cited per-voice source record says “All Rights Reserved.”
 
 ### Wake word
 
-The wakeword models come from openWakeWord v0.5.1 and are licensed
-CC-BY-NC-SA-4.0. They are distributed as a distinct asset only for uses allowed
-by that license. Recipients must preserve attribution, use the models
-noncommercially, indicate modifications, and ShareAlike any adaptations. The
-full legal text and exact model hashes are embedded.
+The wake engine is microWakeWord, built from TensorFlow Lite Micro, FlatBuffers,
+KissFFT, and a printf implementation. Its models come from the ESPHome
+micro_wake_word Model Collection and are licensed Apache-2.0, which covers the
+trained `.tflite` weights and their `.json` manifests. The payload embeds the
+upstream LICENSE and NOTICE attribution, the runtime notices, and the exact
+model hashes.
 
 “Alexa” is a trademark of Amazon.com, Inc. The compatibility identifier does
 not imply Amazon sponsorship or endorsement.

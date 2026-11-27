@@ -43,8 +43,9 @@ no wakeword entry. The signed OTA manifest carries
 `feature_policy=redistributable` and its signature and boot payload hash were
 verified independently.
 
-The Alexa-compatible wakeword model remains `CC-BY-NC-SA-4.0`, is classified as
-a restricted noncommercial payload, and is not redistributed in this profile.
+The microWakeWord models are `Apache-2.0` and are not redistributed in this
+profile: the wakeword payload remains a separate asset outside the
+redistributable feature set.
 
 ## Verification boundary
 

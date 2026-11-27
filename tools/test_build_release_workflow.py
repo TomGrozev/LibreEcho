@@ -98,7 +98,7 @@ class Tests(unittest.TestCase):
   self.assertIn('Build public neural dependencies', W)
   self.assertNotIn('public-neural-deps-', W)
   for variable in (
-    'LIBREECHO_WAKE_ORT_SOURCE', 'LIBREECHO_ORT_BUILD',
+    'LIBREECHO_ORT_BUILD',
     'LIBREECHO_ORT_PREFIX', 'LIBREECHO_WAKE_FLATBUFFERS_PYTHON',
     'LIBREECHO_SHERPA_SOURCE', 'LIBREECHO_SHERPA_PREFIX',
     'LIBREECHO_SPEEX_PREFIX',

@@ -55,10 +55,10 @@ request:
 
 The request-based materials are part of the release-closure record even
 though they are not normal public download assets. The `community-noncommercial`
-scope includes all five payloads and is cleared only when the CC-BY-NC-SA-4.0
-model restriction, attribution, ShareAlike terms, and exact source/relink offer
-are retained and can be furnished to recipients. Neither scope is a publication
-or hardware-acceptance claim by itself.
+scope includes all five payloads and is cleared only when the microWakeWord
+Apache-2.0 attribution and exact source/relink offer are retained and can be
+furnished to recipients. Neither scope is a publication or hardware-acceptance
+claim by itself.
 
 The four MT8163 connectivity firmware files are **owner-device-local inputs**.
 They are never stored in this repository, CI artifacts, OTA archives, or GitHub
@@ -75,12 +75,14 @@ included only in those named scopes. Owner-local or user-supplied dependencies
 must use `release_status: not-redistributed` and are omitted from redistributed
 SPDX packages.
 
-The wakeword payload is deliberately separate and remains subject to
-CC-BY-NC-SA-4.0, including its noncommercial and ShareAlike conditions. The TTS
-voices remain separate CC-BY-SA-4.0 assets. These restrictions are presented in
-the release notes and embedded legal text; they are not hidden behind the MIT
-license used by LibreEcho-authored product code. Do not describe a
-`community-noncommercial` release as permitting unrestricted commercial reuse.
+The wakeword payload is deliberately separate. Its microWakeWord models and
+runtime are Apache-2.0, and the payload keeps the upstream LICENSE and NOTICE
+attribution. The payload stays scoped to `community-noncommercial` until it is
+rebuilt and its source offer regenerated. The TTS voices remain separate
+CC-BY-SA-4.0 assets. These conditions are presented in the release notes and
+embedded legal text; they are not hidden behind the MIT license used by
+LibreEcho-authored product code. Do not describe a `community-noncommercial`
+release as permitting unrestricted commercial reuse.
 
 Amonet support remains an external user-supplied integration. LibreEcho does not
 publish upstream Amonet archives, signed vendor boot-chain partitions, wrapper

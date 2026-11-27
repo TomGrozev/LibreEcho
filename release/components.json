@@ -260,32 +260,30 @@
     },
     {
       "id": "wakeword-payload",
-      "name": "openWakeWord runtime and pretrained Alexa-compatible model",
+      "name": "microWakeWord runtime and pretrained wake-word models",
       "version": "source-offer-sha256:8be7517a3f2feff5effe36f259ec2c35e3ffeded779fbfc4386f0c5bcb9833ac",
-      "license": "(MIT AND CC-BY-NC-SA-4.0 AND BSD-3-Clause)",
+      "license": "(Apache-2.0 AND MIT AND BSD-3-Clause)",
       "release_status": "cleared",
       "distribution_scope": "separate-payload",
       "allowed_release_scopes": [
         "community-noncommercial"
       ],
-      "download_location": "https://github.com/dscripka/openWakeWord/tree/v0.5.1",
+      "download_location": "https://github.com/esphome/micro-wake-word-models",
       "source_offer": "https://github.com/aslater3/LibreEcho-Platform",
       "evidence": [
         "release/THIRD_PARTY_NOTICES.md",
         "release/PUBLIC-AUDIO-SOURCE-CLOSURE.md",
         "release/COMMUNITY-NONCOMMERCIAL-SOURCE-CLOSURE.md"
       ],
-      "use_restriction": "noncommercial-model-asset",
       "closed_subcomponents": [
         "tracked-model-hash-contracts",
-        "onnx-runtime-source-commit-pin",
+        "tflite-micro-source-commit-pin",
         "flatbuffers-python-source-pin",
-        "path-independent-ort-build",
-        "serialized-ort-build",
-        "cc-by-nc-sa-attribution-bundle",
-        "community-noncommercial-policy-verification"
+        "microwakeword-runtime-build",
+        "apache-2.0-notice-and-attribution-bundle",
+        "release-scope-policy-verification"
       ],
-      "blocker": "Excluded from commercially unrestricted releases; cleared only for an explicitly labelled community-noncommercial release that preserves the model licence, attribution, modification notice, ShareAlike terms, and source/relink offer."
+      "blocker": "Excluded from commercially unrestricted releases until the microWakeWord payload is rebuilt and its source/relink closure regenerated. The bundled models and runtime are Apache-2.0 and the separate payload preserves their LICENSE and NOTICE attribution."
     },
     {
       "id": "assistant-payload",
