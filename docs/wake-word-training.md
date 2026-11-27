@@ -1,149 +1,148 @@
 # Training a custom wake word
 
-LibreEcho can run an owner-trained openWakeWord model in place of the stock
-"Alexa" model. You train the model with outside tools, then use the host tool
-in `tools/wakeword/` to check, package and host-score it, and finally stage the
-folder on the device. This guide covers the exact contract the device loads.
+LibreEcho runs microWakeWord models, small TensorFlow Lite Micro classifiers,
+in place of the stock "Alexa" word. You train the model with outside tools,
+then stage its folder on the device. This guide covers the exact contract the
+device loads and the steps that stage it.
 
-What this does not give you yet:
+What this does not give you:
 
 - LibreEcho does not train models. Training data and the training run are
-  yours (see section 2).
-- Only one model is active at a time. The stock detector is always used; only
-  the model file is replaceable.
-- The device still reports the wake phrase as "Alexa" in its status and UI,
-  even when a custom model is loaded.
-- A host score is a proxy. The device adds its own gating (see section 4).
-- The device-side load and detection of a newly trained word has not been
-  verified in this repository. Treat your first run as an experiment and keep
-  your backups (see section 5).
+  yours (section 2).
+- One word runs at a time, with an optional second word. The bundled word is
+  always installed; only the selection and owner folders change.
+- A host score is a proxy. The device adds its own gate (section 4).
+- Loading and detecting a newly trained word on the device is not verified in
+  this repository. Treat your first run as an experiment and keep your backups.
 
 ## 1. What the device loads
 
-The wake engine (`LibreEcho-UI`, `src/adapter/wake_engine_onnx.cpp`) runs three
-ONNX graphs for every 80 ms block (1280 samples at 16 kHz, mono, 16-bit):
+The wake engine (`LibreEcho-UI`, `src/adapter/wake_engine_mww.cpp`) runs
+TensorFlow Lite Micro with the microfrontend from TFLM. Every 10 ms of
+16 kHz mono 16-bit audio becomes one feature row of 40 int8 channels (30 ms
+window, 125 to 7500 Hz); every three rows, one per model, are fed to the
+classifier as int8 `[1, 3, 40]`, and the classifier returns uint8 `[1, 1]`.
+One probability is produced per 30 ms step, and the device compares the mean
+of the last `sliding_window_size` probabilities with the cutoff.
 
-| File | Input | Output | Notes |
-|---|---|---|---|
-| `melspectrogram.onnx` | `input` float `[batch, samples]` | `output` | Fed the 480 overlap samples from the previous block plus the 1280 new ones (1280 for the first block). Raw int16 values as float. Output is scaled by `x / 10 + 2`. |
-| `embedding_model.onnx` | `input_1` float `[1, 76, 32, 1]` | `conv2d_19` | 76 mel frames of 32 bins in; 96 features out. |
-| `alexa_v0.1.onnx` (the classifier) | `onnx::Flatten_0` float `[1, 16, 96]` | `13` float `[1, 1]` | Score in 0..1, one per block. |
+A model is a folder named after the word, holding exactly two files:
 
-The classifier file must be named `alexa_v0.1.onnx` inside the model folder,
-whatever your word is. The name is a fixed contract in the engine.
+```
+<name>/<name>.tflite   the microWakeWord classifier
+<name>/<name>.json     its manifest
+```
 
-Classifier rules, enforced by the tool:
+The manifest is the ESPHome microWakeWord shape:
 
-- Input and output names and shapes exactly as above, opset 13 as the stock
-  model uses.
-- Operators limited to `Flatten`, `Gemm`, `Relu` and `Sigmoid`, as in the
-  stock classifier. Other operators are refused. Layers that export to
-  `ReduceMean` or `Sqrt` (a LayerNorm, for example) were reported to fail to
-  load on the device's stock detector runtime ([LibreEcho#241](https://github.com/aslater3/LibreEcho/issues/241)).
-  Remove such layers, or fold them into the neighbouring `Gemm` weights, before
-  export.
-- The model must end in `Sigmoid`, so the score is a probability.
-- One self-contained `.onnx` file. No external weight files.
-
-Feature models: copy `melspectrogram.onnx` and `embedding_model.onnx` from the
-same openWakeWord release your trainer uses. The LibreEcho build inputs pin
-these SHA-256 values; the tool reports whether your copies match them:
-
-| File | SHA-256 (0.14.x build inputs) |
+| Field | Meaning |
 |---|---|
-| `melspectrogram.onnx` | `ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f` |
-| `embedding_model.onnx` | `70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f` |
-| `alexa_v0.1.onnx` (stock Alexa classifier) | `6ff566a01d12670e8d9e3c59da32651db1575d17272a601b7f8a39283dfbae3e` |
+| `type` | must be `"micro"` |
+| `version` | must be `2` |
+| `wake_word` | the phrase sent to Home Assistant, e.g. `"Okay Nabu"` |
+| `model` | the classifier file name, `<name>.tflite` |
+| `micro.probability_cutoff` | window mean needed to accept |
+| `micro.sliding_window_size` | probabilities averaged per score |
+| `micro.feature_step_size` | audio window advance in ms (10) |
+| `micro.tensor_arena_size` | bytes the interpreter may use |
+
+Device rules, enforced before a model is accepted:
+
+- The folder name uses 1 to 63 characters from `A-Z a-z 0-9 . _ -` and does
+  not start with `.`.
+- The folder holds exactly `<name>.json` and `<name>.tflite`; no third file.
+  Both must be regular files, not symlinks.
+- The `.tflite` must be a version 3 flatbuffer with one subgraph, an int8
+  input `[1, N, 40]` and a uint8 output `[1, 1]`, and use only the 20
+  operators the device resolver registers. The list mirrors
+  `micro_wake_word_operators.config` in LibreEcho-Platform. Custom operators
+  and any other builtin are refused.
+- `tensor_arena_size` must be at most 65536 bytes. The largest bundled model
+  asks for 26,080 bytes; the cap stops a corrupt manifest from exhausting the
+  heap.
+
+The shared voice-activity model is not part of your folder. The wake payload
+installs it at `<root>/vad/vad.tflite` and `vad.json`, and `waked` copies it
+into the owner model base the first time an owner word runs. A wake is
+accepted only when the word's window mean reaches its cutoff and the VAD
+window reaches 0.5.
 
 ## 2. Train the classifier (outside tools)
 
-Use openWakeWord's own training pipeline (the upstream project is
-`dscripka/openWakeWord`; its automatic model training notebook is the usual
-starting point). That pipeline needs data this repository does not provide:
+Use the microWakeWord training pipeline from the microWakeWord project
+(`esphome/micro-wake-word`, the same project as the models LibreEcho ships).
+It trains a small streaming classifier and exports a `.tflite` plus the JSON
+manifest in the shape above. Your training run needs data this repository does
+not provide:
 
-- positive clips of your word, from text-to-speech, from recordings, or both;
-- a large set of negative clips and features (speech without the word, music,
-  room noise);
-- a Python environment with its training dependencies.
+- positive clips of your word, from text-to-speech, recordings, or both;
+- a large set of negative clips (speech without the word, music, room noise);
+- a Python environment with the training dependencies.
 
-When you export the trained classifier to ONNX, set the graph names the engine
-looks for and the opset:
+Keep the exported `tensor_arena_size`; the device cap above is the only limit
+it is checked against. Do not train your own VAD model: reuse the bundled one.
 
-```python
-torch.onnx.export(
-    model, dummy_input, "alexa_v0.1.onnx",
-    input_names=["onnx::Flatten_0"],
-    output_names=["13"],
-    opset_version=13,
-)
-```
+Licensing: the bundled models are Apache-2.0. Check the licence of every data
+set, TTS voice and recording you train on, and of the trained model if you
+share it. Do not share recordings of other people. Recordings of your
+household are personal data; keep them on your own machine.
 
-Use your trainer's own export code where it differs; the names and shapes must
-still match section 1. The tool checks them.
+## 3. Check the folder before staging
 
-Licensing: the stock Alexa classifier is pinned in the build as CC-BY-NC-SA-4.0.
-Check the licence of every data set, TTS voice and recording you train on, and
-of the trained model if you share it. Do not share recordings of other people.
-Recordings of your household are personal data; keep them on your own machine.
+Copy the trained pair into `<name>/<name>.tflite` and `<name>/<name>.json`,
+using the word name for both the folder and the files, and set the manifest's
+`model` field to `<name>.tflite`.
 
-## 3. Check and package with the host tool
+The web control centre validates a model folder before it accepts or selects
+it, and reports the reason when it refuses one: a missing or extra file, a
+disallowed operator, a wrong tensor type or shape, a missing manifest field or
+an arena over the cap. A refused model is not selected; the stock word stays
+active.
 
-The tool needs Python 3 with the pinned packages in
-`tools/wakeword/requirements.txt`:
-
-```sh
-python3 -m venv .wakeword-venv
-.wakeword-venv/bin/pip install -r tools/wakeword/requirements.txt
-
-# Validate a classifier against the device contract.
-.wakeword-venv/bin/python tools/wakeword/wakeword_model.py check my-classifier.onnx
-
-# Install a model folder: <out>/<name>/ holds exactly the three files, plus
-# <out>/<name>.manifest.json with SHA-256 values.
-.wakeword-venv/bin/python tools/wakeword/wakeword_model.py package \
-    --classifier my-classifier.onnx \
-    --name my-word \
-    --feature-dir /path/to/openwakeword/feature-models \
-    --out ./wakeword-packages
-```
-
-Names may use only letters, digits, `.`, `_` and `-`, and may not start with
-`.`. The tool exits 1 and prints the reason when a check fails. It writes
-nothing when the classifier or feature models are refused.
+The same validation runs in `waked` when it loads a selected folder. A model
+that fails falls back to the stock word and the wake log says why.
 
 ## 4. Host-score clips before the device
 
-Record clips as 16 kHz, mono, 16-bit PCM WAV. Convert other formats with your
-usual audio tools first. Then:
+Record clips as 16 kHz, mono, 16-bit PCM WAV. Convert other formats first.
+
+Run the same package the repository's engine test uses, `pymicro-wakeword`
+2.5.0 with `pymicro-features` 2.0.2, over your clips and your exported model:
 
 ```sh
-.wakeword-venv/bin/python tools/wakeword/wakeword_model.py score \
-    --model-dir ./wakeword-packages/my-word \
-    --sensitivity 50 \
-    clips/word-*.wav clips/silence-*.wav
+python3 -m venv .wakeword-venv
+.wakeword-venv/bin/pip install pymicro-wakeword==2.5.0
+
+.wakeword-venv/bin/python - <<'PY'
+import wave
+from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
+
+model = MicroWakeWord.from_config("my-word/my-word.json")
+features = MicroWakeWordFeatures()
+with wave.open("clips/word-01.wav", "rb") as wav:
+    audio = wav.readframes(wav.getnframes())
+rows = 0
+for offset in range(0, len(audio), 320):  # 160 samples, 10 ms
+    for feature in features.process_streaming(audio[offset:offset + 320]):
+        rows += 1
+        probability = model.process_streaming_prob(feature)
+        if rows % model.stride == 0:
+            print(f"{rows // model.stride:6d} {probability:.4f}")
+PY
 ```
 
-The output lists, per clip, the highest block score, when it occurred, and how
-many blocks reached the threshold. The threshold is the device mapping
-`0.85 - 0.0044 * sensitivity` (0.63 at the default sensitivity 50, 0.41 at 100).
-
-Use the sensitivity you have set on the device. Each clip is scored in a fresh
-stream, and the first five blocks of every clip are zeroed, which mirrors the
-engine's start-up suppression.
+The output is one probability per 30 ms step; the device score is their mean
+over `sliding_window_size`. Run the snippet over one positive clip and one
+silence clip first: the positive clip's window mean should sit well above the
+cutoff and the silence clip's at the model's floor.
 
 Reading the result:
 
-- Positive clips should peak above the threshold, from several speakers and
+- Positive clips should cross the cutoff, from several speakers and
   distances, or the model is not learning the word.
 - Negative clips (speech without the word, TV, music) should stay below it.
-- The device's wake worker also requires support from neighbouring frames
-  before it accepts a peak, and it applies a 1.75 s cooldown after a detection.
-  A block above threshold is necessary to wake the device, not sufficient.
-
-For reference, the stock Alexa model scores the UI test fixtures
-`alexa-twice.wav` (peak 1.0) and `no-wake-word.wav` (peak 0.0026) with this
-pipeline, so a clean separation between a word and silence is what good
-numbers look like.
+- The device also vetoes a wake without an active VAD window and applies a
+  1.75 s cooldown after a detection. A step above the cutoff is necessary to
+  wake the device, not sufficient.
 
 ## 5. Install on the device
 
@@ -151,22 +150,22 @@ Only the owner's device is involved, and these steps write `/data`. Make a
 backup of the current configuration first.
 
 1. Copy the model folder, unchanged, to
-   `/data/libreecho/wakeword-models/<name>/` on the device. Use the copy method
-   you already use for device files. Staged models are excluded from
-   configuration backups, so keep your own copy.
+   `/data/libreecho/wakeword-models/<name>/` on the device. Staged models are
+   excluded from configuration backups, so keep your own copy.
 2. Write the folder name (only the name, no path) to
    `/data/libreecho/config/wake-model`.
 3. Restart the wake service: `/etc/init.d/libreecho-waked.init restart`.
 4. Check `/var/log/libreecho-waked.log`. A successful selection logs
-   `using owner-staged model`. An incomplete folder, an invalid name, or a model
-   the detector cannot load falls back to the stock model, and the log says why.
+   `using owner-staged model`. An incomplete folder, an invalid name, or a
+   model the engine cannot load falls back to the stock word and the log says
+   why.
 5. Say the word and watch for a wake. The web "wake-word test" action is
    synthetic and does not prove real detection.
 
-To return to the stock model, delete `/data/libreecho/config/wake-model` and
-restart the service. The selection and the staged folder both live on `/data`,
-so they are meant to survive reboot and OTA updates. That has not been tested
-on hardware yet.
+To return to the stock word, delete `/data/libreecho/config/wake-model` and
+restart the service. The selection and the staged folder live on `/data`, so
+they are meant to survive reboot and OTA updates. That has not been tested on
+hardware yet.
 
 The detector executable always comes from the signed wake payload. Nothing
 under `/data` is executed, so a bad model cannot run code, only fail to load.
@@ -175,16 +174,20 @@ under `/data` is executed, so a bad model cannot run code, only fail to load.
 
 Verified in this repository (host only):
 
-- The contract constants and the streaming pipeline in `wakeword_model.py`
-  mirror `wake_engine_onnx.cpp` and the classifier contract. `alexa_v0.1.onnx`
-  from the build passes the contract check.
-- The unit tests in `tools/test_wakeword_model.py` cover the name rules,
-  refused operators and names, package layout and manifest, and host scoring
-  against the stock model and UI fixtures.
+- The device engine and the `pymicro-wakeword` reference agree on five of six
+  clip comparisons to within 1/255 per step. The sixth, `alexa-twice`, differs
+  by at most 8/255 on 10 of 370 steps because TFLM and the reference TFLite
+  runtime round kernels differently; the model inputs are byte-identical at
+  those steps.
+- The store and validator tests cover a valid model, a disallowed operator,
+  wrong tensor types, a missing manifest field, an arena over the cap, a
+  leftover ONNX model and the folder rules above.
+- The web picker, the API and the init script tests pass with the new file
+  set.
 
 Not verified here:
 
 - A newly trained word, loaded and detected on a device. That needs your own
   training run and a hardware check.
-- Device acceptance of operators outside the stock set. The tool refuses them
-  on purpose.
+- Device acceptance of operators outside the registered list. The validator
+  refuses them on purpose.
