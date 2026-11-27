@@ -1569,10 +1569,10 @@ if [[ "$WAKEWORD_ENABLED" == 1 ]]; then
       exit 1
     }
     for wake_model in alexa okay_nabu hey_jarvis hey_mycroft vad; do
-      install -m 0644 "$WAKE_TFLM_MODELS_ROOT/$wake_model.tflite" \
-        "$WAKE_TFLM_STAGE/models/$wake_model.tflite"
-      install -m 0644 "$WAKE_TFLM_MODELS_ROOT/$wake_model.json" \
-        "$WAKE_TFLM_STAGE/models/$wake_model.json"
+      install -D -m 0644 "$WAKE_TFLM_MODELS_ROOT/$wake_model.tflite" \
+        "$WAKE_TFLM_STAGE/models/$wake_model/$wake_model.tflite"
+      install -D -m 0644 "$WAKE_TFLM_MODELS_ROOT/$wake_model.json" \
+        "$WAKE_TFLM_STAGE/models/$wake_model/$wake_model.json"
     done
     component_cache_store wake-tflm "$wake_tflm_cache_key" "$WAKE_TFLM_STAGE"
   fi
