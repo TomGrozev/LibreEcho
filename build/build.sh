@@ -216,6 +216,10 @@ WAKEWORD_MANIFEST_OVERRIDE="${LIBREECHO_WAKEWORD_MANIFEST_OVERRIDE:-}"
 STT_PAYLOAD_OVERRIDE="${LIBREECHO_STT_PAYLOAD_OVERRIDE:-}"
 STT_MANIFEST_OVERRIDE="${LIBREECHO_STT_MANIFEST_OVERRIDE:-}"
 PUBLIC_RELEASE_MODE="${LIBREECHO_PUBLIC_RELEASE:-0}"
+# The source-offer assembler and the production userdata tree are produced by
+# maintainer-private tooling that is not part of this repository, so the
+# private lane needs an explicit opt-out to build from public sources alone.
+SOURCE_OFFERS_MODE="${LIBREECHO_SOURCE_OFFERS:-}"
 PRODUCT_SRC="${LIBREECHO_PRODUCT_SRC:-}"
 product_head=
 product_state=not-applicable
@@ -514,6 +518,14 @@ case "$FEATURE_POLICY" in
   *) echo "ERROR: invalid feature policy: $FEATURE_POLICY" >&2; exit 1 ;;
 esac
 case "$PUBLIC_RELEASE_MODE" in 0|1) ;; *) echo "ERROR: LIBREECHO_PUBLIC_RELEASE must be 0 or 1" >&2; exit 1 ;; esac
+case "$SOURCE_OFFERS_MODE" in
+  '') SOURCE_OFFERS_MODE=1 ;;
+  0|1) ;;
+  *) echo "ERROR: LIBREECHO_SOURCE_OFFERS must be 0 or 1" >&2; exit 1 ;;
+esac
+if [[ "$PUBLIC_RELEASE_MODE" == 1 ]]; then
+  SOURCE_OFFERS_MODE=0
+fi
 if [[ "$FEATURE_POLICY" == exclude && "$SERVICE_PROFILE" != diagnostic ]]; then
   echo "ERROR: feature exclusion requires --service-profile diagnostic" >&2
   exit 1
@@ -750,11 +762,11 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
   ESPEAK_SOURCE="${LIBREECHO_ESPEAK_SOURCE:?ERROR: set LIBREECHO_ESPEAK_SOURCE explicitly}"
   FLITE_SOURCE="${LIBREECHO_FLITE_SOURCE:?ERROR: set LIBREECHO_FLITE_SOURCE explicitly}"
   SPEEX_PREFIX="${LIBREECHO_SPEEX_PREFIX:?ERROR: set LIBREECHO_SPEEX_PREFIX explicitly}"
-  if [[ "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+  if [[ "$SOURCE_OFFERS_MODE" == 1 ]]; then
     SOURCE_OFFER_INPUTS="${LIBREECHO_SOURCE_OFFER_INPUTS:?ERROR: set LIBREECHO_SOURCE_OFFER_INPUTS explicitly}"
   fi
   feature_directories=("$SHERPA_SOURCE" "$SHERPA_PREFIX" "$ORT_BUILD" "$ORT_PREFIX" "$ESPEAK_SOURCE" "$FLITE_SOURCE" "$SPEEX_PREFIX")
-  [[ "$PUBLIC_RELEASE_MODE" == 1 ]] || feature_directories+=("$SOURCE_OFFER_INPUTS")
+  [[ "$SOURCE_OFFERS_MODE" == 0 ]] || feature_directories+=("$SOURCE_OFFER_INPUTS")
   for directory in "${feature_directories[@]}"; do
     [[ -d "$directory" && ! -L "$directory" ]] || {
       echo "ERROR: explicit feature dependency is missing or a symlink: $directory" >&2
@@ -774,7 +786,7 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
     rm -rf "$FLITE_SOURCE/build"
     cp -a "$FLITE_BUILT_ROOT/build" "$FLITE_SOURCE/build"
   fi
-  if [[ "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+  if [[ "$SOURCE_OFFERS_MODE" == 1 ]]; then
   [[ -x "$ASSEMBLE_SOURCE_OFFERS" ]] || {
     echo "ERROR: source-offer assembler is unavailable: $ASSEMBLE_SOURCE_OFFERS" >&2
     exit 1
@@ -2598,7 +2610,7 @@ fi
 USERDATA_TREE=
 userdata_manifest_sha=
 userdata_tree_bytes=
-if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+if [[ "$FEATURES_ENABLED" == 1 && "$SOURCE_OFFERS_MODE" == 1 ]]; then
   USERDATA_TREE="$RUN/userdata-tree"
   echo "=== preparing clean production userdata tree ==="
   "$PIPELINE/prepare_userdata_tree.sh" "$RUN" "$USERDATA_TREE" | tee "$RUN/userdata-tree-build.log"
@@ -2606,14 +2618,16 @@ if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
   userdata_tree_bytes="$(du -s -B1 "$USERDATA_TREE" | awk '{print $1}')"
   echo "userdata_tree_manifest_sha256=$userdata_manifest_sha"
   echo "userdata_tree_bytes=$userdata_tree_bytes"
-else
+elif [[ "$PUBLIC_RELEASE_MODE" == 1 ]]; then
   echo "=== feature userdata excluded by public base policy ==="
+else
+  echo "=== feature userdata excluded by LIBREECHO_SOURCE_OFFERS=0 ==="
 fi
 
 source_offer_index=
 source_offer_manifest_sha256=
 source_offer_archives=()
-if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+if [[ "$FEATURES_ENABLED" == 1 && "$SOURCE_OFFERS_MODE" == 1 ]]; then
   echo "=== snapshotting immutable run-local source-offer relink inputs ==="
   SOURCE_OFFER_RELINK_STAGE="$RUN/source-offer-relink-stage"
   SOURCE_OFFER_RELINK_ROOT="$RUN/components/source-offer-relink"
