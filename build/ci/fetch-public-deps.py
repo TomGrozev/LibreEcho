@@ -161,6 +161,27 @@ def _submodules(record: dict) -> list:
     return subs
 
 
+def _validate_model_pins(record: dict) -> None:
+    """Check a source-git record's per-file model digests.
+
+    A model source clone is not itself digest-pinned, so every shipped
+    ``.tflite`` path and its sha256 are declared and verified after checkout.
+    """
+    models = record.get("models")
+    if models is None:
+        return
+    if record.get("kind") != "source-git" or not isinstance(models, list) or not models:
+        raise ValueError(f"model pins are invalid: {record.get('name')}")
+    seen: set = set()
+    for pin in models:
+        if not isinstance(pin, dict):
+            raise ValueError(f"model pin is malformed: {record.get('name')}")
+        path = pin.get("path")
+        validate_submodule_path(record["name"], path, seen)
+        if not SHA.fullmatch(str(pin.get("sha256", ""))):
+            raise ValueError(f"model pin has no digest: {record['name']}: {path}")
+
+
 def load(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema") != SCHEMA or not isinstance(data.get("inputs"), list):
@@ -182,6 +203,7 @@ def load(path: Path) -> dict:
                 raise ValueError(f"source-git input is not pinned: {item['name']}")
             if item["redistribution"] != "source-git-pinned":
                 raise ValueError(f"source-git input has invalid redistribution: {item['name']}")
+            _validate_model_pins(item)
         if item["name"].startswith(SENDSPIN_PREFIX):
             # Sendspin is staged from immutable, hash-verified archives, not from
             # moving git refs: every sendspin source (and each of its transitive
@@ -1311,6 +1333,14 @@ def stage(
             checkout = output / record["name"]
             subprocess.run(["git", "clone", "--quiet", "--filter=blob:none", record["url"], str(checkout)], check=True)
             subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", record["commit"]], check=True)
+            for pin in record.get("models") or []:
+                path = pin["path"]
+                _assert_no_symlink_ancestors(checkout, path)
+                model_path = checkout / path
+                _ensure_within(checkout, model_path)
+                if not model_path.is_file() or sha256_file(model_path) != pin["sha256"]:
+                    raise ValueError(
+                        f"model digest mismatch: {record['name']}: {path}")
             continue
         if record["kind"] == "source-archive-tree":
             archive_path = output / (record["name"] + ".archive")

@@ -143,6 +143,12 @@ WAKE_SPEEX_ARCHIVE="$INPUTS/speexdsp-SpeexDSP-1.2.1.tar.gz"
 WAKE_MEL_MODEL="$INPUTS/melspectrogram.onnx"
 WAKE_EMBEDDING_MODEL="$INPUTS/embedding_model.onnx"
 WAKE_CLASSIFIER_MODEL="$INPUTS/alexa_v0.1.onnx"
+WAKE_TFLM_SOURCE="${LIBREECHO_WAKE_TFLM_SOURCE:-$INPUTS/tflite-micro-source}"
+WAKE_TFLM_FLATBUFFERS_SOURCE="${LIBREECHO_WAKE_TFLM_FLATBUFFERS_SOURCE:-$INPUTS/flatbuffers-source}"
+WAKE_TFLM_KISSFFT_SOURCE="${LIBREECHO_WAKE_TFLM_KISSFFT_SOURCE:-$INPUTS/kissfft-source}"
+WAKE_TFLM_PRINTF_SOURCE="${LIBREECHO_WAKE_TFLM_PRINTF_SOURCE:-$INPUTS/eyalroz-printf-source}"
+WAKE_TFLM_MODELS_ROOT="${LIBREECHO_WAKE_MWW_MODELS:-$INPUTS/micro-wake-word-models-source/models/v2}"
+WAKE_TFLM_PREFIX=
 STT_MODEL_ROOT="${LIBREECHO_STT_MODEL_ROOT:-}"
 STT_ENCODER="$STT_MODEL_ROOT/encoder-epoch-99-avg-1.int8.onnx"
 STT_DECODER="$STT_MODEL_ROOT/decoder-epoch-99-avg-1.int8.onnx"
@@ -527,6 +533,28 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
       echo "ERROR: missing pinned ONNX Runtime source: $WAKE_ORT_SOURCE" >&2
       exit 1
     }
+    for wake_tflm_dir in "$WAKE_TFLM_SOURCE" "$WAKE_TFLM_FLATBUFFERS_SOURCE" \
+        "$WAKE_TFLM_KISSFFT_SOURCE" "$WAKE_TFLM_PRINTF_SOURCE" \
+        "$WAKE_TFLM_MODELS_ROOT"; do
+      [[ -d "$wake_tflm_dir" && ! -L "$wake_tflm_dir" ]] || {
+        echo "ERROR: missing pinned microWakeWord input directory: $wake_tflm_dir" >&2
+        exit 1
+      }
+    done
+    [[ -d "$WAKE_TFLM_SOURCE/.git" ]] || {
+      echo "ERROR: missing pinned TensorFlow Lite Micro source: $WAKE_TFLM_SOURCE" >&2
+      exit 1
+    }
+    for wake_model in alexa okay_nabu hey_jarvis hey_mycroft vad; do
+      for wake_model_file in \
+          "$WAKE_TFLM_MODELS_ROOT/$wake_model.tflite" \
+          "$WAKE_TFLM_MODELS_ROOT/$wake_model.json"; do
+        [[ -f "$wake_model_file" && ! -L "$wake_model_file" ]] || {
+          echo "ERROR: missing microWakeWord model input: $wake_model_file" >&2
+          exit 1
+        }
+      done
+    done
   fi
   for stt_input in "$STT_ENCODER" "$STT_DECODER" "$STT_JOINER" \
       "$STT_TOKENS" "$STT_MODEL_LICENSE"; do
@@ -1502,6 +1530,67 @@ TTS_DAEMON="$UI_SOURCE/build/libreecho-ttsd-sherpa"
 }
 
 if [[ "$WAKEWORD_ENABLED" == 1 ]]; then
+  echo "=== restoring or building microWakeWord TFLite Micro runtime ==="
+  WAKE_TFLM_BUILDER="$TOOLS_DIR/wakeword/build_micro_wake_word.sh"
+  [[ -x "$WAKE_TFLM_BUILDER" ]] || {
+    echo "ERROR: microWakeWord runtime builder is missing: $WAKE_TFLM_BUILDER" >&2
+    exit 1
+  }
+  wake_tflm_commit="$(git -C "$WAKE_TFLM_SOURCE" rev-parse HEAD)"
+  wake_tflm_cache_key="$(component_cache_key wake-tflm \
+    --value "contract=micro-wake-word-tflm-v1" \
+    --value "tflm_commit=$wake_tflm_commit" \
+    --value "jobs=$JOBS" --value "ui_toolchain=$UI_TOOLCHAIN_KEY" \
+    --tree "platform-wakeword=$TOOLS_DIR/wakeword" \
+    --tree "flatbuffers-source=$WAKE_TFLM_FLATBUFFERS_SOURCE" \
+    --tree "kissfft-source=$WAKE_TFLM_KISSFFT_SOURCE" \
+    --tree "eyalroz-printf-source=$WAKE_TFLM_PRINTF_SOURCE" \
+    --file "host-make=$(command -v make)" \
+    --file "host-python=$(command -v python3)" \
+    --file "host-patch=$(command -v patch)")"
+  WAKE_TFLM_STAGE="$RUN/wake-tflm-stage"
+  rm -rf "$WAKE_TFLM_STAGE" "$RUN/components/wake-tflm"
+  wake_tflm_status=rebuilt
+  if component_cache_restore wake-tflm "$wake_tflm_cache_key" "$WAKE_TFLM_STAGE"; then
+    wake_tflm_status=hit
+    printf 'component_cache_hit=wake-tflm\n' >"$RUN/wake-tflm-build.log"
+  else
+    mkdir -p "$WAKE_TFLM_STAGE/models"
+    "$WAKE_TFLM_BUILDER" \
+      --tflm-source "$WAKE_TFLM_SOURCE" --tflm-commit "$wake_tflm_commit" \
+      --flatbuffers-source "$WAKE_TFLM_FLATBUFFERS_SOURCE" \
+      --kissfft-source "$WAKE_TFLM_KISSFFT_SOURCE" \
+      --eyalroz-printf-source "$WAKE_TFLM_PRINTF_SOURCE" \
+      --output "$WAKE_TFLM_STAGE/prefix" \
+      --toolchain "$UI_CROSS" --jobs "$JOBS" | tee "$RUN/wake-tflm-build.log"
+    [[ -f "$WAKE_TFLM_STAGE/prefix/lib/libtflm-micro.a" && \
+       -f "$WAKE_TFLM_STAGE/prefix/lib/libmicrowakeword-frontend.a" ]] || {
+      echo "ERROR: microWakeWord runtime build did not produce both archives" >&2
+      exit 1
+    }
+    for wake_model in alexa okay_nabu hey_jarvis hey_mycroft vad; do
+      install -m 0644 "$WAKE_TFLM_MODELS_ROOT/$wake_model.tflite" \
+        "$WAKE_TFLM_STAGE/models/$wake_model.tflite"
+      install -m 0644 "$WAKE_TFLM_MODELS_ROOT/$wake_model.json" \
+        "$WAKE_TFLM_STAGE/models/$wake_model.json"
+    done
+    component_cache_store wake-tflm "$wake_tflm_cache_key" "$WAKE_TFLM_STAGE"
+  fi
+  component_materialize wake-tflm "$wake_tflm_cache_key" "$wake_tflm_status" \
+    "$WAKE_TFLM_STAGE" "$RUN/components/wake-tflm"
+  rm -rf "$WAKE_TFLM_STAGE"
+  WAKE_TFLM_PREFIX="$RUN/components/wake-tflm/prefix"
+  export WAKE_TFLM_PREFIX
+  export WAKE_TFLM_INCLUDE="$WAKE_TFLM_PREFIX/include"
+  export WAKE_TFLM_LIB="$WAKE_TFLM_PREFIX/lib/libtflm-micro.a"
+  export WAKE_TFLM_FRONTEND_LIB="$WAKE_TFLM_PREFIX/lib/libmicrowakeword-frontend.a"
+  export WAKE_MWW_MODELS="$RUN/components/wake-tflm/models"
+  [[ -f "$WAKE_TFLM_LIB" && -f "$WAKE_TFLM_FRONTEND_LIB" && \
+     -d "$WAKE_MWW_MODELS" ]] || {
+    echo "ERROR: materialized microWakeWord runtime is incomplete" >&2
+    exit 1
+  }
+
   echo "=== restoring or building reduced ARM32 wakeword dependencies ==="
   WAKE_RUNTIME_BUILDER="$TOOLS_DIR/wakeword/build_runtime.sh"
   [[ -x "$WAKE_RUNTIME_BUILDER" ]] || {
