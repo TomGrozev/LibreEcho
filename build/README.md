@@ -201,6 +201,10 @@ Lidar image and OTA inputs:
 - `LIBREECHO_TARGET_RELEASE_TAG` (required): the release tag the target
   manifest and OTA catalog bind. For Lidar the asset prefix becomes
   `libreecho-lidar-<tag>`; it must be stable per build.
+- `LIBREECHO_OTBR_SOURCE` (required): an OpenThread Border Router
+  (`ot-br-posix`) checkout.
+- `LIBREECHO_OTBR_DEPS` (required): the dependency prefix built for that
+  source tree by the Platform `otbr/build_otbr_deps.sh` recipe.
 
 Boot discovery runtime: the shared mDNS runtime is a boot-contained
 dependency. The hosted job builds and verifies it separately; locally, leave
@@ -234,6 +238,8 @@ export LIBREECHO_OTA_PUBLIC_KEY=$LIBREECHO_PRIVATE_ROOT/keys/ed25519-public.hex
 export LIBREECHO_OTA_RELEASE=<x.y.z>
 export LIBREECHO_TARGET_RELEASE_TAG=radar-puffin-build-<sha7>-<id16>-<build16>
 export LIBREECHO_OTA_EXPECTED_PUBLIC_KEY_SHA256=<sha256 of the public key file>
+export LIBREECHO_OTBR_SOURCE=<ot-br-posix checkout>
+export LIBREECHO_OTBR_DEPS=<build_otbr_deps prefix>
 # ...plus the toolchain, source-archive, and feature inputs listed above.
 
 build/build.sh --target lidar --profile ota --no-publish

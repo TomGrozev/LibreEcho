@@ -472,6 +472,10 @@ BOOT_ENVELOPE_GENERATOR="$IMAGE_TOOLS_DIR/generate_boot_envelope.py"
 LIDAR_STOCK_BOOT="${LIBREECHO_LIDAR_STOCK_BOOT:-}"
 LIDAR_WIFI_PATCH="${LIBREECHO_LIDAR_WIFI_PATCH:-$INPUTS/mt7668pr2h.bin}"
 LIDAR_WIFI_LICENCE="${LIBREECHO_LIDAR_WIFI_LICENCE:-$INPUTS/LICENCE.mediatek}"
+LIDAR_EFR32_SOURCE="$TOOLS_DIR/efr32/lidar-efr32.c"
+OTBR_BUILDER="$TOOLS_DIR/otbr/build_otbr.sh"
+OTBR_SOURCE="${LIBREECHO_OTBR_SOURCE:-}"
+OTBR_DEPS="${LIBREECHO_OTBR_DEPS:-}"
 # The ARM32 v1 bridge is the default for both legacy targets. Lidar only ships
 # signed v3 OTA images, because its boot chain has no v1 updater slot.
 if [[ -z "$OTA_FORMAT" ]]; then
@@ -705,6 +709,28 @@ if [[ "$KERNEL_ARCH" == arm64 ]]; then
     echo "ERROR: missing or unsafe MediaTek firmware licence: $LIDAR_WIFI_LICENCE" >&2
     exit 1
   }
+  [[ -f "$LIDAR_EFR32_SOURCE" && ! -L "$LIDAR_EFR32_SOURCE" ]] || {
+    echo "ERROR: missing EFR32 radio source: $LIDAR_EFR32_SOURCE" >&2
+    exit 1
+  }
+  [[ "$SSH_ENABLED" == 0 ]] || {
+    echo "ERROR: the Lidar recovery image has no SSH staging contract" >&2
+    exit 1
+  }
+  if [[ "$IMAGE_PROFILE" == ota ]]; then
+    [[ -x "$OTBR_BUILDER" ]] || {
+      echo "ERROR: OpenThread border router builder is missing: $OTBR_BUILDER" >&2
+      exit 1
+    }
+    [[ -n "$OTBR_SOURCE" && -d "$OTBR_SOURCE" && ! -L "$OTBR_SOURCE" ]] || {
+      echo "ERROR: set LIBREECHO_OTBR_SOURCE to the pinned ot-br-posix checkout" >&2
+      exit 1
+    }
+    [[ -n "$OTBR_DEPS" && -d "$OTBR_DEPS" && ! -L "$OTBR_DEPS" ]] || {
+      echo "ERROR: set LIBREECHO_OTBR_DEPS to the build_otbr_deps.sh prefix" >&2
+      exit 1
+    }
+  fi
 fi
 [[ -f "$OTA_PUBLIC_KEY" && ! -L "$OTA_PUBLIC_KEY" ]] || { echo "ERROR: missing OTA public key" >&2; exit 1; }
 if [[ "$IMAGE_PROFILE" == ota && "$OTA_SIGNING_MODE" == local ]]; then
@@ -2341,6 +2367,38 @@ if [[ "$WAKEWORD_ENABLED" == 1 ]]; then
 fi
 fi
 
+# The Thread runtime rides with the OTA image only: the diagnostic image has no
+# responder to register with, which mirrors the reviewed lab image set.
+LIDAR_EFR32_BINARY=
+lidar_efr32_sha=
+OTBR_AGENT=
+otbr_agent_sha=
+lidar_thread_builder_args=()
+if [[ "$KERNEL_ARCH" == arm64 && "$IMAGE_PROFILE" == ota ]]; then
+  echo "=== building static ARM32 EFR32 radio tool ==="
+  "${UI_CROSS}gcc" -O2 -Wall -Wextra -Werror -static \
+    -o "$RUN/lidar-efr32" "$LIDAR_EFR32_SOURCE" 2>&1 | tee "$RUN/lidar-efr32-build.log"
+  LIDAR_EFR32_BINARY="$RUN/lidar-efr32"
+  lidar_efr32_sha="$(sha256sum "$LIDAR_EFR32_BINARY" | awk '{print $1}')"
+  echo "lidar_efr32_sha256=$lidar_efr32_sha"
+
+  echo "=== building the static ARM32 OpenThread border agent ==="
+  OT_BR_SRC="$OTBR_SOURCE" OTBR_DEPS="$OTBR_DEPS" \
+    ARM_CC="${UI_CROSS}gcc" ARM_CXX="${UI_CROSS}g++" JOBS="$JOBS" \
+    "$OTBR_BUILDER" "$RUN/otbr-build" | tee "$RUN/otbr-build.log"
+  OTBR_AGENT="$RUN/otbr-build/src/agent/otbr-agent"
+  [[ -f "$OTBR_AGENT" && ! -L "$OTBR_AGENT" ]] || {
+    echo "ERROR: OpenThread border agent was not built: $OTBR_AGENT" >&2
+    exit 1
+  }
+  otbr_agent_sha="$(sha256sum "$OTBR_AGENT" | awk '{print $1}')"
+  echo "otbr_agent_sha256=$otbr_agent_sha"
+  lidar_thread_builder_args=(
+    --lidar-efr32 "$LIDAR_EFR32_BINARY"
+    --otbr-agent "$OTBR_AGENT"
+  )
+fi
+
 ssh_builder_args=()
 ssh_verifier_args=()
 dropbear_sha=
@@ -2543,6 +2601,7 @@ else
     --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
     --mdns-runtime "$MDNS_RUNTIME_ROOT" \
     "${ssh_builder_args[@]}" \
+    "${lidar_thread_builder_args[@]}" \
     --output "$RUN/boot.img" \
     --ramdisk-output "$RUN/boot.ramdisk.cpio.xz" \
     --manifest "$RUN/manifest.json" | tee "$RUN/build.log"
@@ -2852,7 +2911,11 @@ lidar_stock_boot_sha256=$stock_boot_sha
 lidar_wifi_patch=$LIDAR_WIFI_PATCH
 lidar_wifi_patch_sha256=$lidar_wifi_patch_sha
 lidar_wifi_licence=$LIDAR_WIFI_LICENCE
-lidar_wifi_licence_sha256=$lidar_wifi_licence_sha"
+lidar_wifi_licence_sha256=$lidar_wifi_licence_sha
+lidar_efr32=$LIDAR_EFR32_BINARY
+lidar_efr32_sha256=$lidar_efr32_sha
+otbr_agent=$OTBR_AGENT
+otbr_agent_sha256=$otbr_agent_sha"
 fi
 
 cat > "$RUN/provenance.txt" <<EOF
