@@ -25,8 +25,9 @@ ROOT = Path(__file__).resolve().parents[2]
 LEGACY_GENERATOR_COMMIT = 'c48fe070f38bd2c974257656961918254848758b'
 CI = ROOT / 'build/ci'
 sys.path.insert(0, str(CI))
-from target_registry import (KNOWN_TARGETS, asset_prefix, contract_target, descriptor_sha256,
-    load_target, parse_targets, platform_target_args, target_from_product, validate_descriptor)
+from target_registry import (KNOWN_TARGETS, accepted_targets, asset_prefix, contract_target, descriptor_sha256,
+    hardware_accepted, load_target, parse_targets, platform_target_args, require_shared_kernel,
+    target_from_product, validate_descriptor)
 from ota_v2_product import ContractError, validate_control_tar, validate_plan, validate_inventory, validate_stable_publisher
 from release_route import route
 from combined_release import assert_parity
@@ -56,6 +57,10 @@ def read_kv(path):
 
 def write_kv(path, data):
     path.write_text(''.join(f'{key}={value}\n' for key, value in data.items()))
+
+# Radar and Biscuit share kernel, userspace and payloads; their parity
+# assertions must not spread to targets with a different SoC or kernel arch.
+PARITY_TARGETS = ('radar_puffin', 'biscuit')
 
 
 def bind_target(run, target, channel, key=None):
@@ -103,7 +108,7 @@ class DescriptorTests(unittest.TestCase):
             data = load_target(target)
             self.assertEqual(data['target_id'], target)
             self.assertEqual(descriptor_sha256(target), hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
-        radar, biscuit = map(load_target, KNOWN_TARGETS)
+        radar, biscuit = map(load_target, PARITY_TARGETS)
         for field in ('kernel', 'soc', 'arch', 'features', 'layout_profiles'):
             self.assertEqual(radar[field], biscuit[field])
         # Operator decision (0.14.0): both targets are hardware-accepted.
@@ -113,6 +118,31 @@ class DescriptorTests(unittest.TestCase):
     def test_unknown_or_duplicate_targets_refused(self):
         for value in ('unknown', '', 'radar_puffin,radar_puffin', 'radar_puffin, biscuit', 'radar_puffin,../biscuit'):
             with self.subTest(value=value), self.assertRaises(ValueError): parse_targets(value)
+
+    def test_target_set_must_share_one_kernel_build(self):
+        script = CI / 'validate-targets.py'
+
+        def run(*targets):
+            return subprocess.run([sys.executable, str(script), '--targets', ','.join(targets)],
+                                  capture_output=True, text=True, timeout=120)
+
+        for targets in (('radar_puffin', 'biscuit'), ('lidar',), ('biscuit',), ('radar_puffin',)):
+            with self.subTest(targets=targets):
+                result = run(*targets)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        shared = run('radar_puffin', 'biscuit')
+        self.assertEqual([json.loads(line)['board'] for line in shared.stdout.splitlines()],
+                         ['radar_puffin', 'biscuit'])
+        mixed = run('radar_puffin', 'lidar')
+        self.assertNotEqual(mixed.returncode, 0)
+        self.assertIn('target set spans different kernel builds', mixed.stderr)
+        for target in ('radar_puffin', 'lidar'):
+            self.assertIn(target, mixed.stderr)
+        for field in ('arch', 'kernel.defconfig', 'kernel.dtb'):
+            self.assertIn(field, mixed.stderr)
+        self.assertEqual(mixed.stdout, '')
+        for targets in (['lidar'], ['biscuit', 'radar_puffin']):
+            with self.subTest(targets=targets): require_shared_kernel(targets)
 
     def test_bad_descriptor_fields_fail_closed(self):
         radar = load_target()
@@ -140,6 +170,19 @@ class DescriptorTests(unittest.TestCase):
             self.assertEqual(asset_prefix(tag), 'libreecho-' + tag)
             self.assertEqual(asset_prefix(tag, 'biscuit'), 'libreecho-biscuit-' + tag.removeprefix('radar-puffin-'))
 
+    def test_asset_prefix_covers_every_target(self):
+        tag = 'radar-puffin-v0.14.0'
+        prefixes = {target: asset_prefix(tag, target) for target in KNOWN_TARGETS}
+        self.assertIn('libreecho-lidar-v0.14.0', prefixes.values())
+        self.assertEqual(len(set(prefixes.values())), len(KNOWN_TARGETS))
+        for target, prefix in prefixes.items():
+            # The installer ships alone and repeats the naming rule; drift here
+            # would make it fetch assets the release never published.
+            self.assertEqual(INSTALLER.target_asset_prefix(tag, target), prefix)
+        for bad in ('v0.14.0', 'radar-puffin-latest', 'radar-puffin-v0.14'):
+            with self.subTest(tag=bad), self.assertRaises(ValueError):
+                asset_prefix(bad, 'lidar')
+
     def test_platform_feature_detection_and_radar_only_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             tool = Path(tmp) / 'old.py'
@@ -150,16 +193,83 @@ class DescriptorTests(unittest.TestCase):
             for target in KNOWN_TARGETS:
                 self.assertEqual(platform_target_args(tool, target, descriptor_sha256(target)), ['--target', target, '--target-descriptor-sha256', descriptor_sha256(target)])
 
+    def test_lidar_descriptor_and_soc_flow(self):
+        data = load_target('lidar')
+        self.assertEqual((data['soc'], data['arch'], data['layout_profiles']), ('mt8167', 'arm64', ['kaeru']))
+        self.assertEqual((data['kernel']['defconfig'], data['kernel']['dtb']),
+                         ('mt8167_arm64_defconfig', 'libreecho-lidar.dtb'))
+        self.assertIs(data['hardware_accepted'], False)
+        self.assertEqual(accepted_targets(), PARITY_TARGETS)
+        self.assertIn('lidar', KNOWN_TARGETS)
+        # A cross-SoC descriptor is rejected in either direction.
+        for target, soc in (('radar_puffin', 'mt8167'), ('lidar', 'mt8163')):
+            changed = load_target(target); changed['soc'] = soc
+            with self.subTest(target=target, soc=soc), self.assertRaises(ValueError):
+                validate_descriptor(changed, target)
+        with self.assertRaises(ValueError):
+            validate_descriptor({**load_target('lidar'), 'arch': 'arm32'}, 'lidar')
+
+    def test_lidar_ota_identity_uses_descriptor_soc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            boot = root / 'boot.img'
+            boot.write_bytes(b'ANDROID!' + b'\x00' * (16 * 1024 * 1024 - 8))
+            signing = SigningKey.generate()
+            (root / 'public.hex').write_text(signing.verify_key.encode().hex() + '\n')
+            boot_sha = sha(boot)
+
+            def bundle(soc):
+                raw = ('format=libreecho-ota-v1\nmanifest_version=1\nboard=lidar\nsoc=' + soc +
+                       '\narchitecture=armv7\nimage_profile=ota\nversion=fixture-v1\n'
+                       'service_profile=production\nfeature_policy=community-noncommercial\n'
+                       'update_channel=dev\nboot_filename=boot.img\nboot_size=16777216\n'
+                       'boot_sha256=' + boot_sha + '\n').encode()
+                path = root / (soc + '.ota.tar')
+                with tarfile.open(path, 'w', format=tarfile.USTAR_FORMAT) as archive:
+                    for name, data in (('manifest', raw), ('manifest.sig', signing.sign(raw).signature.hex().encode() + b'\n'),
+                                       ('boot.img', boot.read_bytes())):
+                        record = tarfile.TarInfo(name); record.size = len(data); record.mode = 0o644
+                        archive.addfile(record, io.BytesIO(data))
+                return path
+
+            validate_control_tar(bundle('mt8167'), root / 'public.hex', 'v1', '', expected_target='lidar')
+            with self.assertRaises(ContractError):
+                validate_control_tar(bundle('mt8163'), root / 'public.hex', 'v1', '', expected_target='lidar')
+
+    def test_unaccepted_lidar_cannot_prepare_a_stable_release(self):
+        self.assertFalse(hardware_accepted('lidar'))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = subprocess.run([sys.executable, str(CI / 'prepare-stable-release.py'), '--target', 'lidar',
+                '--artifact-root', str(root / 'artifact'), '--product-root', str(root / 'product'),
+                '--product-commit', 'a' * 40, '--release-version', '0.14.0', '--release-notes', 'notes.md',
+                '--output-dir', str(root / 'out')], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('not hardware-accepted', result.stderr)
+            self.assertFalse((root / 'out').exists())
+
+    def test_radar_and_biscuit_descriptor_digests_unchanged(self):
+        self.assertEqual(descriptor_sha256('radar_puffin'), 'b9e8c5a78178f697634aa3a705ef52efe9f039a162413e289d3e85df3a5b39ab')
+        self.assertEqual(descriptor_sha256('biscuit'), '7c58bec0e9f09652d7ff7ce587c0eb58ee3bd5a22b320ff127f3f85c1690c454')
+
     def test_installer_embedded_mapping_matches_descriptors(self):
-        expected = {t: {k: load_target(t)[k] for k in ('release_slug', 'fastboot_products')} for t in KNOWN_TARGETS}
-        self.assertEqual(INSTALLER.TARGET_INDEX, expected)
-        for product, target in [('RADAR', 'radar_puffin'), ('BISCUIT', 'biscuit')]:
+        self.assertEqual(set(INSTALLER.TARGET_INDEX), set(KNOWN_TARGETS))
+        for target in KNOWN_TARGETS:
+            descriptor = load_target(target)
+            entry = INSTALLER.TARGET_INDEX[target]
+            self.assertEqual((entry['release_slug'], entry['fastboot_products']),
+                             (descriptor['release_slug'], descriptor['fastboot_products']), target)
+            self.assertEqual(entry['soc'], descriptor['soc'], target)
+            self.assertEqual(entry['arch'], descriptor['arch'], target)
+            self.assertEqual(entry['hw_profile'], descriptor['platform']['hw_profile'], target)
+            self.assertEqual(entry['boot_slots'], ['boot_a', 'boot_b'], target)
+        for product, target in [('RADAR', 'radar_puffin'), ('BISCUIT', 'biscuit'), ('LIDAR', 'lidar')]:
             self.assertEqual(target_from_product(product), target)
             with mock.patch.object(INSTALLER, '_run_command', return_value=subprocess.CompletedProcess([], 0, '', 'product: ' + product)):
                 self.assertEqual(INSTALLER.verify_fastboot_product('mock', 'fixture'), target)
-                self.assertEqual(INSTALLER.verify_fastboot_product('mock', 'fixture', 'radar_puffin', 'radar_puffin'), 'radar_puffin')
-                if target == 'biscuit':
-                    with self.assertRaises(INSTALLER.InstallerError): INSTALLER.verify_fastboot_product('mock', 'fixture', 'radar_puffin')
+                self.assertEqual(INSTALLER.verify_fastboot_product('mock', 'fixture', target, target), target)
+                wrong = next(t for t in KNOWN_TARGETS if t != target)
+                with self.assertRaises(INSTALLER.InstallerError): INSTALLER.verify_fastboot_product('mock', 'fixture', wrong)
 
     def test_old_expdb_erase_guard_and_brom_path_are_gone(self):
         for name in ('LEGACY_EXPDB_ERASE_CLOSURES', 'require_legacy_expdb_erase', 'download_amonet',
@@ -229,8 +339,10 @@ class DescriptorTests(unittest.TestCase):
                    'release_tag': 'radar-puffin-v0.14.0', 'release_notes': 'release/radar-puffin-v0.14.0.md'}
         request.update(ssh_enabled='disabled')
         original = route(request, 'release/0.14.0', 'workflow_dispatch')
-        for targets in (['radar_puffin'], ['biscuit'], list(KNOWN_TARGETS)):
+        for targets in (['radar_puffin'], ['biscuit'], list(PARITY_TARGETS)):
             self.assertEqual(route({**request, 'targets': targets}, 'release/0.14.0', 'workflow_dispatch'), original)
+        with self.assertRaisesRegex(ValueError, 'hardware-accepted'):
+            route({**request, 'targets': ['lidar']}, 'release/0.14.0', 'workflow_dispatch')
         with self.assertRaises(ValueError): route({**request, 'targets': ['biscuit'], 'board': 'radar_puffin'}, 'release/0.14.0', 'workflow_dispatch')
 
 
@@ -239,16 +351,16 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifact = root / 'combined'; artifact.mkdir()
-            for target in KNOWN_TARGETS:
+            for target in PARITY_TARGETS:
                 run, _ = dev_fixture(root / target)
                 bind_target(run, target, 'dev')
                 shutil.move(str(run), artifact / target)
-            (artifact / 'release-request.json').write_text(json.dumps({'targets': list(KNOWN_TARGETS)}))
+            (artifact / 'release-request.json').write_text(json.dumps({'targets': list(PARITY_TARGETS)}))
             result = prepare(CI / 'prepare-dev-release.py', artifact, root / 'out')
             self.assertEqual(result.returncode, 0, result.stderr)
             tag = dict(l.split('=', 1) for l in result.stdout.splitlines() if '=' in l)['release_tag']
             self.assertTrue(tag.startswith('radar-puffin-build-'))
-            for target in KNOWN_TARGETS:
+            for target in PARITY_TARGETS:
                 prefix = asset_prefix(tag, target)
                 data = json.loads((root / 'out' / (prefix + '-build.json')).read_text())
                 self.assertEqual((data['board'], data['target_descriptor_sha256']), (target, descriptor_sha256(target)))
@@ -259,13 +371,13 @@ class ReleaseTests(unittest.TestCase):
     def stable_combined(self, root):
         artifact = root / 'combined'; artifact.mkdir()
         signing = SigningKey.generate()
-        for target in KNOWN_TARGETS:
+        for target in PARITY_TARGETS:
             single, product = stable_fixture(root / target)
             run = single / 'run'
             (run / 'release-request.json').unlink()
             bind_target(run, target, 'stable', signing)
             shutil.move(str(run), artifact / target)
-        (artifact / 'release-request.json').write_text(json.dumps({'schema': 'libreecho-release-request-v1', 'targets': list(KNOWN_TARGETS),
+        (artifact / 'release-request.json').write_text(json.dumps({'schema': 'libreecho-release-request-v1', 'targets': list(PARITY_TARGETS),
             'channel': 'stable', 'version': '0.14.0', 'release_tag': 'radar-puffin-v0.14.0', 'release_notes': 'release/radar-puffin-v0.14.0.md'}))
         result = prepare(CI / 'prepare-stable-release.py', artifact, root / 'out', product)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -275,7 +387,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _, out = self.stable_combined(Path(tmp))
             self.assertEqual(validate_stable_publisher(out, 'radar-puffin-v0.14.0'), {p.name for p in out.iterdir()})
-            for target in KNOWN_TARGETS:
+            for target in PARITY_TARGETS:
                 prefix = asset_prefix('radar-puffin-v0.14.0', target)
                 self.assertEqual(json.loads((out / (prefix + '-build.json')).read_text())['board'], target)
                 self.assertTrue((out / f'libreecho-{load_target(target)["release_slug"]}-stable.ota.tar').is_file())
@@ -297,7 +409,7 @@ class ReleaseTests(unittest.TestCase):
     def test_parity_gate_refuses_different_shared_feature_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            runs = {t: dev_fixture(root / t)[0] for t in KNOWN_TARGETS}
+            runs = {t: dev_fixture(root / t)[0] for t in PARITY_TARGETS}
             for target, run in runs.items(): bind_target(run, target, 'dev')
             assert_parity(runs)
             (runs['biscuit'] / 'features/tts.squashfs').write_bytes(b'different')
@@ -379,26 +491,26 @@ class ReleaseTests(unittest.TestCase):
                 (dest / ('libreecho-' + slug + '-install.zip')).write_bytes(('test-zip-' + target).encode())
                 (dest / ('libreecho-' + slug + '-bundle.manifest')).write_text('target=' + target + '\ndevice=' + target + '\nfastboot_products=' + ','.join(load_target(target)['fastboot_products']) + '\n')
             gate = mock.MagicMock()
-            gate.TARGETS = {target: load_target(target)['release_slug'] for target in KNOWN_TARGETS}
+            gate.TARGETS = {target: load_target(target)['release_slug'] for target in PARITY_TARGETS}
             with mock.patch.object(TWRP, 'platform_target_args', side_effect=lambda tool, target: ['--target', target]), \
                  mock.patch.object(TWRP.subprocess, 'run', side_effect=run), \
                  mock.patch.object(TWRP.importlib.util, 'find_spec', return_value=object()), \
                  mock.patch.dict(sys.modules, {'release_completeness': gate}):
                 count = TWRP.build_installs(out, artifact)
             self.assertEqual(gate.check_assets.call_count, 2)
-            self.assertEqual({call.kwargs['target'] for call in gate.check_assets.call_args_list}, set(KNOWN_TARGETS))
-            self.assertEqual(set(calls), set(KNOWN_TARGETS))
+            self.assertEqual({call.kwargs['target'] for call in gate.check_assets.call_args_list}, set(PARITY_TARGETS))
+            self.assertEqual(set(calls), set(PARITY_TARGETS))
             self.assertEqual(count, len(list(out.iterdir())))
             for name, alias in [('libreecho-radar-puffin-install.zip', 'libreecho-install.zip'), ('libreecho-radar-puffin-bundle.manifest', 'bundle.manifest')]:
                 self.assertEqual((out / name).read_bytes(), (out / alias).read_bytes())
-            for target in KNOWN_TARGETS:
+            for target in PARITY_TARGETS:
                 self.assertTrue((out / f'libreecho-radar-puffin-v0.14.0-{load_target(target)["release_slug"]}-TWRPINSTALL-SHA256SUMS').is_file())
             validate_stable_publisher(out, 'radar-puffin-v0.14.0')
 
 
 class SigningTests(unittest.TestCase):
     def test_plan_inventory_and_signed_control_bind_both_targets(self):
-        for target in KNOWN_TARGETS:
+        for target in PARITY_TARGETS:
             with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 plan, inventory, assets, boot, key = v2_fixture(root)
@@ -423,11 +535,11 @@ class SigningTests(unittest.TestCase):
                     validate_control_tar(bundle, root / 'public.hex', 'v2', '0.14.0', feature_plan=plan, feature_inventory=inventory,
                         feature_asset_dir=assets, boot_path=boot, expected_channel='stable', expected_target=target,
                         expected_key_sha256=sha(root / 'public.hex'))
-                with self.assertRaises(ContractError): validate_control_tar(bundle, root / 'public.hex', 'v2', '0.14.0', expected_target=next(t for t in KNOWN_TARGETS if t != target))
+                with self.assertRaises(ContractError): validate_control_tar(bundle, root / 'public.hex', 'v2', '0.14.0', expected_target=next(t for t in PARITY_TARGETS if t != target))
 
     def test_real_handoff_creation_and_target_mismatch_refusal(self):
         platform = Path(os.environ.get('LIBREECHO_PLATFORM_SRC', str(ROOT.parent / 'platform')))
-        for target in KNOWN_TARGETS:
+        for target in PARITY_TARGETS:
             with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
                 run = Path(tmp)
                 plan, inventory, assets, boot, key = v2_fixture(run)
@@ -454,14 +566,14 @@ class SigningTests(unittest.TestCase):
                 self.assertEqual(data['board'], target)
                 self.assertEqual(data['target_descriptor_sha256'], descriptor_sha256(target))
                 self.assertTrue(any(r['name'] == target + '.json' for r in data['product_runtime']['product_tools']))
-                data['board'] = next(t for t in KNOWN_TARGETS if t != target)
+                data['board'] = next(t for t in PARITY_TARGETS if t != target)
                 data['target_descriptor_sha256'] = descriptor_sha256(data['board'])
                 handoff.write_text(json.dumps(data))
                 with self.assertRaisesRegex(HandoffError, 'baseline target mismatch'): validate_handoff(handoff)
 
     def test_signer_argument_vector_contains_selected_target(self):
         with mock.patch('sign_ota_candidate.platform_target_args', side_effect=lambda tool, target: ['--target', target]), mock.patch('sign_ota_candidate.subprocess.run') as run:
-            for target in KNOWN_TARGETS:
+            for target in PARITY_TARGETS:
                 command = invoke_platform_signer(Path('fixture.py'), boot_image=Path('boot'), build_manifest=Path('manifest'), signing_key=Path('key'),
                     public_key=Path('public'), output=Path('out'), plan=Path('plan'), release='0.14.0', update_channel='dev', target=target)
                 self.assertEqual(command[-2:], ['--target', target])

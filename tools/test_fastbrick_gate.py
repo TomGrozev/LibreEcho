@@ -435,8 +435,10 @@ class PostBrickIdentityTests(unittest.TestCase):
 class NoExpdbWriteTests(unittest.TestCase):
     def test_no_expdb_erase_or_write_exists_in_the_installer(self):
         source = (ROOT / "tools/libreecho-install.py").read_text()
-        for needle in ("erase expdb", "flash expdb", '"expdb"', "'expdb'"):
-            self.assertNotIn(needle, source, needle)
+        # The Lidar gate reads expdb[0:16] over the fastboot USB interface;
+        # nothing may write or erase it, and the locked path never names it in
+        # a command (the behavioural test below covers that).
+        self.assertNotRegex(source, r'"(?:flash|erase)",\s*"expdb"|(?:flash|erase) expdb')
 
     def test_no_command_touching_expdb_is_ever_issued_on_the_locked_path(self):
         for target, spec in TARGETS.items():
@@ -453,6 +455,17 @@ class NoExpdbWriteTests(unittest.TestCase):
                     INSTALLER.plan_fastbrick("fb", "SERIAL", target, "x.zip", cache)
                     INSTALLER.brick_fastboot_payload("fb", "SERIAL", payload, 0)
                 self.assertFalse(any("expdb" in " ".join(c) for c in fake.calls), fake.calls)
+
+
+class HostRequirementTests(unittest.TestCase):
+    def test_lidar_needs_pyusb_before_the_brick(self):
+        with mock.patch.object(INSTALLER.importlib.util, "find_spec", return_value=None) as finder:
+            INSTALLER._require_lidar_pyusb("radar_puffin")
+            finder.assert_not_called()
+            with self.assertRaisesRegex(INSTALLER.InstallerError, "pyusb"):
+                INSTALLER._require_lidar_pyusb("lidar")
+        with mock.patch.object(INSTALLER.importlib.util, "find_spec", return_value=object()):
+            INSTALLER._require_lidar_pyusb("lidar")
 
 
 class PackagedHostFastbootTests(unittest.TestCase):

@@ -36,12 +36,12 @@ chmod 0700 "$PRIVATE_ROOT"
 ln -sfn -- "$PIPELINE/package_feature_payload.sh" "$BUILD_ROOT/package_feature_payload.sh"
 export LIBREECHO_PIPELINE_ROOT="$BUILD_ROOT"
 IMAGE_PROFILE="${LIBREECHO_IMAGE_PROFILE:-development}"
+# --profile is parsed after this default, so the service profile is re-derived
+# once the effective image profile is known unless one was named explicitly.
+SERVICE_PROFILE_EXPLICIT=0
 if [[ -n "${LIBREECHO_SERVICE_PROFILE+x}" ]]; then
   SERVICE_PROFILE="$LIBREECHO_SERVICE_PROFILE"
-elif [[ "$IMAGE_PROFILE" == ota ]]; then
-  SERVICE_PROFILE=production
-else
-  SERVICE_PROFILE=diagnostic
+  SERVICE_PROFILE_EXPLICIT=1
 fi
 FEATURE_POLICY="${LIBREECHO_FEATURE_POLICY:-preserve}"
 UPDATE_CHANNEL="${LIBREECHO_UPDATE_CHANNEL:-dev}"
@@ -51,7 +51,9 @@ KERNEL_SRC="$(cd -- "$KERNEL_SRC_INPUT" && pwd -P)"
 TOOLING_SRC_INPUT="${LIBREECHO_TOOLING_SRC:?ERROR: set LIBREECHO_TOOLING_SRC explicitly}"
 [[ -d "$TOOLING_SRC_INPUT" ]] || { echo "ERROR: tooling source directory not found: $TOOLING_SRC_INPUT" >&2; exit 1; }
 TOOLING_SRC="$(cd -- "$TOOLING_SRC_INPUT" && pwd -P)"
-TOOLS_DIR="$TOOLING_SRC/tools/mt8163-arm32"
+# TOOLS_DIR and every path derived from it are target-scoped, so they are set
+# after the descriptor is resolved (see the KERNEL_ARCH block).
+TOOLS_DIR=
 KERNEL_OUT_INPUT="${LIBREECHO_KERNEL_OUT:?ERROR: set LIBREECHO_KERNEL_OUT explicitly outside source trees}"
 mkdir -p "$KERNEL_OUT_INPUT"
 KERNEL_OUT="$(cd -- "$KERNEL_OUT_INPUT" && pwd -P)"
@@ -77,7 +79,6 @@ AUDIO_TOOLS_DIR="$GENERATED_ROOT/audio-tools"
 WIRELESS_TOOLS_OUTPUT="$GENERATED_ROOT/wireless-tools"
 WIRELESS_REGDB_OUTPUT="$GENERATED_ROOT/wireless-regdb"
 LIBSODIUM_OUTPUT="$GENERATED_ROOT/libsodium-1.0.18"
-NETWORK_TOOLS_BUILDER="$TOOLS_DIR/network-tools/build_wireless_tools.sh"
 AIRPLAY_SYSROOT="${LIBREECHO_AIRPLAY_SYSROOT:?ERROR: set LIBREECHO_AIRPLAY_SYSROOT explicitly}"
 if [[ -n "${LIBREECHO_AIRPLAY_CXX:-}" ]]; then
   AIRPLAY_CXX="$LIBREECHO_AIRPLAY_CXX"
@@ -98,13 +99,35 @@ AIRPLAY_TINYALSA_ARCHIVE="$INPUTS/tinyalsa-e43025bbf702eb7dd8edd48c1eb50530c60f1
 # The shared mDNS discovery runtime is a boot-contained dependency, not a
 # feature payload: Home Assistant discovery must work without an AirPlay
 # installation.  The hosted pipeline builds it from the exact package lock and
-# independently verifies it; these inputs are the verified runtime root, its
-# manifest identity, and the corresponding-source/notice provenance record.
-MDNS_RUNTIME_ROOT="${LIBREECHO_MDNS_RUNTIME_ROOT:?ERROR: set the verified shared mDNS runtime root}"
-MDNS_RUNTIME_SOURCE_MAP="${LIBREECHO_MDNS_RUNTIME_SOURCE_MAP:?ERROR: set the verified shared mDNS runtime provenance record}"
-MDNS_RUNTIME_MANIFEST_SHA256="${LIBREECHO_MDNS_RUNTIME_MANIFEST_SHA256:?ERROR: set the verified shared mDNS runtime manifest identity}"
+# independently verifies it. When these roots are not supplied, build.sh builds
+# the runtime itself from the same lock through ci/build-mdns-runtime.sh.
+MDNS_RUNTIME_ROOT="${LIBREECHO_MDNS_RUNTIME_ROOT:-}"
+MDNS_RUNTIME_SOURCE_MAP="${LIBREECHO_MDNS_RUNTIME_SOURCE_MAP:-}"
+MDNS_RUNTIME_MANIFEST_SHA256="${LIBREECHO_MDNS_RUNTIME_MANIFEST_SHA256:-}"
+MDNS_PACKAGE_ARCHIVES="${LIBREECHO_MDNS_PACKAGE_ARCHIVES:-}"
 MDNS_RUNTIME_LOCK="$PIPELINE/inputs/mdns-packages.lock.json"
 MDNS_RUNTIME_SOURCE_OFFERS="$PIPELINE/inputs/mdns-source-offers.json"
+# Without a caller-supplied verified runtime, build one from the same package
+# lock the hosted pipeline uses. A partial caller set is refused: a runtime
+# root, its provenance record and its manifest identity only mean something as
+# one triple.
+if [[ -z "$MDNS_RUNTIME_ROOT" && -z "$MDNS_RUNTIME_SOURCE_MAP" && \
+      -z "$MDNS_RUNTIME_MANIFEST_SHA256" ]]; then
+  echo "=== building the shared mDNS discovery runtime ==="
+  LIBREECHO_TOOLING_SRC="$TOOLING_SRC/tools" \
+    LIBREECHO_MDNS_PACKAGE_ARCHIVES="$MDNS_PACKAGE_ARCHIVES" \
+    "$PIPELINE/ci/build-mdns-runtime.sh" "$BUILD_ROOT/mdns-runtime" \
+    | tee "$GENERATED_ROOT/mdns-runtime-build.log"
+  # outputs.env sets the three LIBREECHO_MDNS_* variables for this shell.
+  . "$BUILD_ROOT/mdns-runtime/outputs.env"
+  MDNS_RUNTIME_ROOT="$LIBREECHO_MDNS_RUNTIME_ROOT"
+  MDNS_RUNTIME_SOURCE_MAP="$LIBREECHO_MDNS_RUNTIME_SOURCE_MAP"
+  MDNS_RUNTIME_MANIFEST_SHA256="$LIBREECHO_MDNS_RUNTIME_MANIFEST_SHA256"
+elif [[ -z "$MDNS_RUNTIME_ROOT" || -z "$MDNS_RUNTIME_SOURCE_MAP" || \
+        -z "$MDNS_RUNTIME_MANIFEST_SHA256" ]]; then
+  echo "ERROR: set LIBREECHO_MDNS_RUNTIME_ROOT, LIBREECHO_MDNS_RUNTIME_SOURCE_MAP and LIBREECHO_MDNS_RUNTIME_MANIFEST_SHA256 together, or none to build the runtime" >&2
+  exit 1
+fi
 UI_SOURCE="${LIBREECHO_UI_SRC:?ERROR: set LIBREECHO_UI_SRC explicitly}"
 UI_CROSS="${LIBREECHO_UI_CROSS:-/usr/bin/arm-linux-gnueabihf-}"
 CORE_RUNTIME_SYSROOT="${LIBREECHO_CORE_RUNTIME_SYSROOT:?ERROR: set exact ARMHF glibc sysroot}"
@@ -118,8 +141,6 @@ CORE_GCC_LIBDIR="${LIBREECHO_CORE_GCC_LIBDIR:?ERROR: set exact ARMHF GCC runtime
 # the release workflow installs outside the source trees.
 MBEDTLS_SOURCE_ARCHIVE="${LIBREECHO_MBEDTLS_SOURCE_ARCHIVE:?ERROR: set LIBREECHO_MBEDTLS_SOURCE_ARCHIVE explicitly}"
 MBEDTLS_BUILD_PYTHON="${LIBREECHO_MBEDTLS_BUILD_PYTHON:?ERROR: set LIBREECHO_MBEDTLS_BUILD_PYTHON explicitly}"
-MBEDTLS_BUILDER="$TOOLS_DIR/mbedtls/build_mbedtls.sh"
-MBEDTLS_SOURCE_LOCK="$TOOLS_DIR/mbedtls/SOURCE.lock"
 # The bundle builds its own source-locked Opus stack, not a caller-certified prefix.
 OPUS_ARCHIVES_DIR="${LIBREECHO_OPUS_ARCHIVES_DIR:?ERROR: set LIBREECHO_OPUS_ARCHIVES_DIR explicitly}"
 SHERPA_SOURCE=
@@ -154,15 +175,14 @@ ASSISTANT_CA_BUNDLE="$INPUTS/ca-certificates-20260601.crt"
 ASSISTANT_CA_COPYRIGHT="$INPUTS/ca-certificates-20260601.copyright"
 SSH_ENABLED="${LIBREECHO_SSH_ENABLED:-0}"
 JOBS="${JOBS:-$(nproc)}"
-OTA_DIR="$TOOLS_DIR/ota"
-PLATFORM_RUNTIME_VERIFIER="$TOOLS_DIR/feature_runtime/verify_runtime.py"
-OTA_PUBLIC_KEY="$OTA_DIR/ota-public-key.hex"
 OTA_SIGNING_KEY="${LIBREECHO_OTA_SIGNING_KEY:-$PRIVATE_ROOT/ota-signing-key.hex}"
-OTA_SIGNING_MODE="${LIBREECHO_OTA_SIGNING_MODE:-github}"
+OTA_SIGNING_MODE="${LIBREECHO_OTA_SIGNING_MODE:-}"
 # Release workflow dispatches pass v2 explicitly. Local builds which do not
 # name a format retain the v1 bridge fallback. v2 uses the verified prior
 # release catalog; no Product-side compatibility fields are invented here.
-OTA_FORMAT="${LIBREECHO_OTA_FORMAT:-v1}"
+# The default is resolved after the target's kernel arch is known: the ARM64
+# Lidar target only ships v3 signed OTA images, ARM32 keeps the v1 bridge.
+OTA_FORMAT="${LIBREECHO_OTA_FORMAT:-}"
 OTA_RELEASE="${LIBREECHO_OTA_RELEASE:-}"
 OTA_TARGET_RELEASE_TAG="${LIBREECHO_TARGET_RELEASE_TAG:-}"
 OTA_EXPECTED_PUBLIC_KEY_SHA256="${LIBREECHO_OTA_EXPECTED_PUBLIC_KEY_SHA256:-}"
@@ -181,8 +201,6 @@ OTA_MUSL_TARGET_GCC_LIB="$(
 )"
 ADBD_SOURCE="${LIBREECHO_ADBD_SOURCE:?ERROR: set LIBREECHO_ADBD_SOURCE to a clean pinned AOSP system/core checkout}"
 ADBD_KERNEL_HEADERS="${LIBREECHO_ADBD_KERNEL_HEADERS:?ERROR: set LIBREECHO_ADBD_KERNEL_HEADERS to an exported Linux UAPI tree}"
-ADBD_BUILDER="$TOOLS_DIR/adbd/build_adbd.sh"
-BOOT_ENVELOPE_GENERATOR="$TOOLS_DIR/generate_boot_envelope.py"
 KERNEL_ZIMAGE_OVERRIDE="${LIBREECHO_KERNEL_ZIMAGE_OVERRIDE:-}"
 KERNEL_ZIMAGE_OVERRIDE_SHA256="${LIBREECHO_KERNEL_ZIMAGE_OVERRIDE_SHA256:-}"
 KERNEL_SYSTEM_MAP_OVERRIDE="${LIBREECHO_KERNEL_SYSTEM_MAP_OVERRIDE:-}"
@@ -198,6 +216,10 @@ WAKEWORD_MANIFEST_OVERRIDE="${LIBREECHO_WAKEWORD_MANIFEST_OVERRIDE:-}"
 STT_PAYLOAD_OVERRIDE="${LIBREECHO_STT_PAYLOAD_OVERRIDE:-}"
 STT_MANIFEST_OVERRIDE="${LIBREECHO_STT_MANIFEST_OVERRIDE:-}"
 PUBLIC_RELEASE_MODE="${LIBREECHO_PUBLIC_RELEASE:-0}"
+# The source-offer assembler and the production userdata tree are produced by
+# maintainer-private tooling that is not part of this repository, so the
+# private lane needs an explicit opt-out to build from public sources alone.
+SOURCE_OFFERS_MODE="${LIBREECHO_SOURCE_OFFERS:-}"
 PRODUCT_SRC="${LIBREECHO_PRODUCT_SRC:-}"
 product_head=
 product_state=not-applicable
@@ -335,7 +357,7 @@ adopt_feature_payload() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh [--target radar_puffin|biscuit] [--targets radar_puffin,biscuit] \
+Usage: ./build.sh [--target radar_puffin|biscuit|lidar] [--targets radar_puffin,biscuit] \
   [--defconfig] [--profile development|ota] \
   [--service-profile diagnostic|production] \
   [--feature-policy exclude|preserve|redistributable|community-noncommercial] \
@@ -343,10 +365,9 @@ Usage: ./build.sh [--target radar_puffin|biscuit] [--targets radar_puffin,biscui
   [--reuse-components] \
   [--no-publish]
 
-Builds the current LibreEcho-Kernel ARM32 zImage incrementally, generates the
-reviewed Radar Puffin Android-v0/MediaTek envelope, packages it with the audited
-recovery service, runs the independent image verifier, and publishes
-pipeline/out/CURRENT.
+Builds the current LibreEcho-Kernel image (ARM32 zImage or ARM64 Image)
+incrementally, packages the target envelope, runs the independent image
+verifier, and publishes pipeline/out/CURRENT for Radar Puffin.
 
 --no-publish writes the immutable run and its CURRENT.candidate record but
 leaves canonical pipeline/out/CURRENT and pipeline/out/current untouched.
@@ -374,6 +395,7 @@ while (($#)); do
       shift
       (($#)) || { echo "ERROR: --service-profile requires a value" >&2; exit 1; }
       SERVICE_PROFILE=$1
+      SERVICE_PROFILE_EXPLICIT=1
       ;;
     --feature-policy)
       shift
@@ -393,6 +415,13 @@ while (($#)); do
   esac
   shift
 done
+if [[ "$SERVICE_PROFILE_EXPLICIT" != 1 ]]; then
+  if [[ "$IMAGE_PROFILE" == ota ]]; then
+    SERVICE_PROFILE=production
+  else
+    SERVICE_PROFILE=diagnostic
+  fi
+fi
 # Resolve the registry before cache restore/compilation. Scaffolding requires
 # identical kernel/DTB/feature inputs across the selected target set.
 TARGETS="${TARGETS:-$TARGET}"
@@ -401,7 +430,56 @@ IFS=, read -r -a selected_targets <<< "$TARGETS"
 TARGET="${selected_targets[0]}"
 target_values="$(python3 -B "$PIPELINE/ci/validate-targets.py" --targets "$TARGET" --shell)"
 eval "$target_values" # only schema-validated identifiers/digests; no user strings
-TOOLS_DIR="$TOOLING_SRC/tools/$TOOLS_PROFILE"
+case "$KERNEL_ARCH" in
+  arm)
+    KERNEL_IMAGE_NAME=zImage
+    KERNEL_BOOT_SUBDIR=arch/arm/boot
+    KERNEL_DTS_SUBDIR=arch/arm/boot/dts
+    KERNEL_DTB_TARGET=$KERNEL_DTB_NAME
+    KERNEL_CROSS="${LIBREECHO_KERNEL_CROSS:-$CROSS}"
+    ;;
+  arm64)
+    KERNEL_IMAGE_NAME=Image
+    KERNEL_BOOT_SUBDIR=arch/arm64/boot
+    KERNEL_DTS_SUBDIR=arch/arm64/boot/dts/mediatek
+    KERNEL_DTB_TARGET=mediatek/$KERNEL_DTB_NAME
+    # The host cross is pinned separately from the armv7 userspace cross; no
+    # userspace binary is ever built with it.
+    KERNEL_CROSS="${LIBREECHO_AARCH64_CROSS:-}"
+    [[ -n "$KERNEL_CROSS" ]] || {
+      echo "ERROR: target $TARGET needs the pinned aarch64 kernel cross; set LIBREECHO_AARCH64_CROSS to the staged usr/bin/aarch64-linux-gnu- prefix" >&2
+      exit 1
+    }
+    ;;
+  *) echo "ERROR: unsupported descriptor kernel arch: $KERNEL_ARCH" >&2; exit 1 ;;
+esac
+# Image tools are target-specific: the MT8167 envelope builder/verifier cannot
+# package an MT8163 image and vice versa. Userspace components stay on the
+# shared ARM32 tree, so Lidar names it separately in its descriptor.
+TOOLS_DIR="$TOOLING_SRC/tools/$USERSPACE_TOOLS_PROFILE"
+IMAGE_TOOLS_DIR="$TOOLING_SRC/tools/$TOOLS_PROFILE"
+NETWORK_TOOLS_BUILDER="$TOOLS_DIR/network-tools/build_wireless_tools.sh"
+OTA_DIR="$TOOLS_DIR/ota"
+OTA_PUBLIC_KEY="${LIBREECHO_OTA_PUBLIC_KEY:-$OTA_DIR/ota-public-key.hex}"
+PLATFORM_RUNTIME_VERIFIER="$TOOLS_DIR/feature_runtime/verify_runtime.py"
+MBEDTLS_BUILDER="$TOOLS_DIR/mbedtls/build_mbedtls.sh"
+MBEDTLS_SOURCE_LOCK="$TOOLS_DIR/mbedtls/SOURCE.lock"
+ADBD_BUILDER="$TOOLS_DIR/adbd/build_adbd.sh"
+BOOT_ENVELOPE_GENERATOR="$IMAGE_TOOLS_DIR/generate_boot_envelope.py"
+# Lidar boots the owner's stock boot_a readback and needs the public MT7668
+# firmware pair. The stock boot is owner-only and never enters Git or the
+# public inventory; the firmware pair is staged by the public fetcher.
+LIDAR_STOCK_BOOT="${LIBREECHO_LIDAR_STOCK_BOOT:-}"
+LIDAR_WIFI_PATCH="${LIBREECHO_LIDAR_WIFI_PATCH:-$INPUTS/mt7668pr2h.bin}"
+LIDAR_WIFI_LICENCE="${LIBREECHO_LIDAR_WIFI_LICENCE:-$INPUTS/LICENCE.mediatek}"
+# The ARM32 v1 bridge is the default for both legacy targets. Lidar only ships
+# signed v3 OTA images, because its boot chain has no v1 updater slot.
+if [[ -z "$OTA_FORMAT" ]]; then
+  if [[ "$KERNEL_ARCH" == arm64 ]]; then OTA_FORMAT=v3; else OTA_FORMAT=v1; fi
+fi
+if [[ -z "$OTA_SIGNING_MODE" ]]; then
+  if [[ "$KERNEL_ARCH" == arm64 ]]; then OTA_SIGNING_MODE=local; else OTA_SIGNING_MODE=github; fi
+fi
 platform_args() {
   local output
   output="$(python3 -B "$PIPELINE/ci/platform-target-args.py" --tool "$1" --target "$TARGET" "${@:2}")" || return
@@ -410,9 +488,15 @@ platform_args() {
 }
 # Probe the whole target/tool frontier now, not after an expensive build.
 for probe_target in "${selected_targets[@]}"; do
-  for probe_tool in generate_boot_envelope.py build_recovery_image.py verify_recovery_image.py ota/make_ota_bundle.py; do
-    python3 -B "$PIPELINE/ci/platform-target-args.py" --tool "$TOOLS_DIR/$probe_tool" --target "$probe_target" >/dev/null
+  for probe_tool in build_recovery_image.py verify_recovery_image.py; do
+    python3 -B "$PIPELINE/ci/platform-target-args.py" --tool "$IMAGE_TOOLS_DIR/$probe_tool" --target "$probe_target" >/dev/null
   done
+  if [[ "$KERNEL_ARCH" == arm ]]; then
+    for probe_tool in generate_boot_envelope.py; do
+      python3 -B "$PIPELINE/ci/platform-target-args.py" --tool "$IMAGE_TOOLS_DIR/$probe_tool" --target "$probe_target" >/dev/null
+    done
+    python3 -B "$PIPELINE/ci/platform-target-args.py" --tool "$TOOLS_DIR/ota/make_ota_bundle.py" --target "$probe_target" >/dev/null
+  fi
 done
 case "$IMAGE_PROFILE" in development|ota) ;; *) echo "ERROR: invalid image profile: $IMAGE_PROFILE" >&2; exit 1 ;; esac
 case "$SERVICE_PROFILE" in diagnostic|production) ;; *) echo "ERROR: invalid service profile: $SERVICE_PROFILE" >&2; exit 1 ;; esac
@@ -434,6 +518,14 @@ case "$FEATURE_POLICY" in
   *) echo "ERROR: invalid feature policy: $FEATURE_POLICY" >&2; exit 1 ;;
 esac
 case "$PUBLIC_RELEASE_MODE" in 0|1) ;; *) echo "ERROR: LIBREECHO_PUBLIC_RELEASE must be 0 or 1" >&2; exit 1 ;; esac
+case "$SOURCE_OFFERS_MODE" in
+  '') SOURCE_OFFERS_MODE=1 ;;
+  0|1) ;;
+  *) echo "ERROR: LIBREECHO_SOURCE_OFFERS must be 0 or 1" >&2; exit 1 ;;
+esac
+if [[ "$PUBLIC_RELEASE_MODE" == 1 ]]; then
+  SOURCE_OFFERS_MODE=0
+fi
 if [[ "$FEATURE_POLICY" == exclude && "$SERVICE_PROFILE" != diagnostic ]]; then
   echo "ERROR: feature exclusion requires --service-profile diagnostic" >&2
   exit 1
@@ -465,6 +557,9 @@ if [[ "$PUBLIC_RELEASE_MODE" == 1 ]]; then
   product_state=clean
   product_diffsha="$(source_state_sha256 "$PRODUCT_SRC")"
 fi
+if [[ "$KERNEL_ARCH" == arm ]]; then
+# The audio FPGA and its SPI driver are MT8163 hardware; MT8516/Lidar has its
+# own machine driver, required below.
 if [[ "$FEATURES_ENABLED" == 1 && "$SERVICE_PROFILE" == production ]]; then
   fpga_firmware="$KERNEL_SRC/firmware/i2s_to_spi_v34.bin"
   [[ -f "$fpga_firmware" && ! -L "$fpga_firmware" ]] || {
@@ -475,9 +570,10 @@ if [[ "$FEATURES_ENABLED" == 1 && "$SERVICE_PROFILE" == production ]]; then
     echo "ERROR: MT8163 audio FPGA firmware identity mismatch" >&2; exit 1
   }
   grep -qx 'CONFIG_SND_SOC_AMZN_MT8163_SPI_AUDIO=y' \
-    "$KERNEL_SRC/arch/arm/configs/$KERNEL_DEFCONFIG" || {
+    "$KERNEL_SRC/arch/$KERNEL_ARCH/configs/$KERNEL_DEFCONFIG" || {
     echo "ERROR: full-feature production build requires the verified MT8163 audio driver" >&2; exit 1
   }
+fi
 fi
 case "$OTA_SIGNING_MODE" in github|local) ;; *) echo "ERROR: invalid OTA signing mode: $OTA_SIGNING_MODE" >&2; exit 1 ;; esac
 case "$OTA_FORMAT" in
@@ -501,7 +597,7 @@ git -C "$TOOLING_SRC" rev-parse --show-toplevel >/dev/null 2>&1 || {
   echo "ERROR: tooling source is not a Git worktree: $TOOLING_SRC" >&2; exit 1;
 }
 [[ -d "$TOOLS_DIR" ]] || {
-  echo "ERROR: MT8163 tooling directory not found: $TOOLS_DIR" >&2; exit 1;
+  echo "ERROR: target tooling directory not found: $TOOLS_DIR" >&2; exit 1;
 }
 [[ -d "$UI_SOURCE" ]] || { echo "ERROR: missing LibreEcho-UI source: $UI_SOURCE" >&2; exit 1; }
 if [[ "$FEATURES_ENABLED" == 1 ]]; then
@@ -576,7 +672,40 @@ fi
 git -C "$UI_SOURCE" rev-parse --show-toplevel >/dev/null 2>&1 || {
   echo "ERROR: LibreEcho-UI source is not a Git worktree: $UI_SOURCE" >&2; exit 1;
 }
-[[ -f "$BOOT_ENVELOPE_GENERATOR" ]] || { echo "ERROR: boot-envelope generator is missing" >&2; exit 1; }
+if [[ "$KERNEL_ARCH" == arm ]]; then
+  [[ -f "$BOOT_ENVELOPE_GENERATOR" ]] || { echo "ERROR: boot-envelope generator is missing" >&2; exit 1; }
+fi
+# The MT8167 Lidar builder builds its own MediaTek envelope from the owner's
+# stock boot_a readback; there is no separate envelope generator for it.
+if [[ "$KERNEL_ARCH" == arm64 ]]; then
+  [[ -n "$LIDAR_STOCK_BOOT" ]] || {
+    echo "ERROR: target $TARGET requires LIBREECHO_LIDAR_STOCK_BOOT (the owner's stock boot_a readback)" >&2
+    exit 1
+  }
+  [[ -f "$LIDAR_STOCK_BOOT" && ! -L "$LIDAR_STOCK_BOOT" ]] || {
+    echo "ERROR: Lidar stock boot is missing or a symlink: $LIDAR_STOCK_BOOT" >&2
+    exit 1
+  }
+  stock_boot_sha="$(sha256sum "$LIDAR_STOCK_BOOT" | awk '{print $1}')"
+  # The MT7668 firmware pair is public and pinned; the override paths only
+  # let a lab stage byte-identical copies, never different bytes.
+  [[ "$LIDAR_WIFI_PATCH" == "$INPUTS/mt7668pr2h.bin" ]] || {
+    echo "ERROR: the Lidar Wi-Fi patch must be the pinned public input $INPUTS/mt7668pr2h.bin" >&2
+    exit 1
+  }
+  [[ "$LIDAR_WIFI_LICENCE" == "$INPUTS/LICENCE.mediatek" ]] || {
+    echo "ERROR: the MediaTek firmware licence must be the pinned public input $INPUTS/LICENCE.mediatek" >&2
+    exit 1
+  }
+  [[ -f "$LIDAR_WIFI_PATCH" && ! -L "$LIDAR_WIFI_PATCH" ]] || {
+    echo "ERROR: missing or unsafe MT7668 Wi-Fi patch: $LIDAR_WIFI_PATCH" >&2
+    exit 1
+  }
+  [[ -f "$LIDAR_WIFI_LICENCE" && ! -L "$LIDAR_WIFI_LICENCE" ]] || {
+    echo "ERROR: missing or unsafe MediaTek firmware licence: $LIDAR_WIFI_LICENCE" >&2
+    exit 1
+  }
+fi
 [[ -f "$OTA_PUBLIC_KEY" && ! -L "$OTA_PUBLIC_KEY" ]] || { echo "ERROR: missing OTA public key" >&2; exit 1; }
 if [[ "$IMAGE_PROFILE" == ota && "$OTA_SIGNING_MODE" == local ]]; then
   [[ -f "$OTA_SIGNING_KEY" && ! -L "$OTA_SIGNING_KEY" ]] || {
@@ -633,11 +762,11 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
   ESPEAK_SOURCE="${LIBREECHO_ESPEAK_SOURCE:?ERROR: set LIBREECHO_ESPEAK_SOURCE explicitly}"
   FLITE_SOURCE="${LIBREECHO_FLITE_SOURCE:?ERROR: set LIBREECHO_FLITE_SOURCE explicitly}"
   SPEEX_PREFIX="${LIBREECHO_SPEEX_PREFIX:?ERROR: set LIBREECHO_SPEEX_PREFIX explicitly}"
-  if [[ "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+  if [[ "$SOURCE_OFFERS_MODE" == 1 ]]; then
     SOURCE_OFFER_INPUTS="${LIBREECHO_SOURCE_OFFER_INPUTS:?ERROR: set LIBREECHO_SOURCE_OFFER_INPUTS explicitly}"
   fi
   feature_directories=("$SHERPA_SOURCE" "$SHERPA_PREFIX" "$ORT_BUILD" "$ORT_PREFIX" "$ESPEAK_SOURCE" "$FLITE_SOURCE" "$SPEEX_PREFIX")
-  [[ "$PUBLIC_RELEASE_MODE" == 1 ]] || feature_directories+=("$SOURCE_OFFER_INPUTS")
+  [[ "$SOURCE_OFFERS_MODE" == 0 ]] || feature_directories+=("$SOURCE_OFFER_INPUTS")
   for directory in "${feature_directories[@]}"; do
     [[ -d "$directory" && ! -L "$directory" ]] || {
       echo "ERROR: explicit feature dependency is missing or a symlink: $directory" >&2
@@ -657,7 +786,7 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
     rm -rf "$FLITE_SOURCE/build"
     cp -a "$FLITE_BUILT_ROOT/build" "$FLITE_SOURCE/build"
   fi
-  if [[ "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+  if [[ "$SOURCE_OFFERS_MODE" == 1 ]]; then
   [[ -x "$ASSEMBLE_SOURCE_OFFERS" ]] || {
     echo "ERROR: source-offer assembler is unavailable: $ASSEMBLE_SOURCE_OFFERS" >&2
     exit 1
@@ -682,6 +811,9 @@ if [[ "$FEATURES_ENABLED" == 1 ]]; then
     }
     pinned_inputs+=(speexdsp-SpeexDSP-1.2.1.tar.gz melspectrogram.onnx embedding_model.onnx alexa_v0.1.onnx)
   fi
+fi
+if [[ "$KERNEL_ARCH" == arm64 ]]; then
+  pinned_inputs+=(mt7668pr2h.bin LICENCE.mediatek)
 fi
 for pinned_input in "${pinned_inputs[@]}"; do
   verify_pinned_input "$pinned_input"
@@ -854,12 +986,12 @@ echo "wpa_supplicant_sha256=$wpa_supplicant_sha"
 
 if ((defconfig)) || [[ ! -f "$KERNEL_OUT/.config" ]]; then
   if ((defconfig)); then
-    echo "=== regenerating ARM32 defconfig (requested) ==="
+    echo "=== regenerating $KERNEL_ARCH defconfig (requested) ==="
   else
-    echo "=== generating ARM32 defconfig (new build directory) ==="
+    echo "=== generating $KERNEL_ARCH defconfig (new build directory) ==="
   fi
-  make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
-    LD="${CROSS}ld.bfd" "$KERNEL_DEFCONFIG"
+  make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH="$KERNEL_ARCH" CROSS_COMPILE="$KERNEL_CROSS" \
+    LD="${KERNEL_CROSS}ld.bfd" "$KERNEL_DEFCONFIG"
 fi
 
 recovery_marker_kconfig=0
@@ -876,8 +1008,8 @@ if grep -Rqs --include='Kconfig*' 'config LIBREECHO_DEV_RECOVERY_MARKER' "$KERNE
       ;;
   esac
 fi
-make -s -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
-  LD="${CROSS}ld.bfd" olddefconfig
+make -s -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH="$KERNEL_ARCH" CROSS_COMPILE="$KERNEL_CROSS" \
+  LD="${KERNEL_CROSS}ld.bfd" olddefconfig
 
 # The 3.18 kernel carries the MediaTek controller and Android gadget under
 # vendor symbols.  Current 6.1 uses the upstream MUSB controller and configfs
@@ -906,46 +1038,68 @@ require_any_config() {
 }
 
 require_any_config y USB_MTK_HDRC USB_MUSB_HDRC
-if grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config"; then
+if [[ "$KERNEL_ARCH" == arm ]] && grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config"; then
   :
 elif grep -qxF 'CONFIG_USB_MUSB_HDRC=y' "$KERNEL_OUT/.config"; then
-  # Generic FunctionFS is not enough: without the MT8163 glue and configfs
-  # functions there is no UDC to bind and neither ADB nor RNDIS can enumerate.
+  # Generic FunctionFS is not enough: without the SoC glue and configfs
+  # functions there is no UDC to bind and neither ADB nor networking can
+  # enumerate.
   require_config CONFIGFS_FS y
   require_config USB_MUSB_MEDIATEK y
   require_config USB_CONFIGFS y
   require_config USB_CONFIGFS_F_FS y
-  require_config USB_CONFIGFS_RNDIS y
-  require_config PINCTRL_MT8163 y
-  require_config MTK_MT8163_CONSYS y
-  require_config MTK_COMBO_WIFI y
-  require_config LEDS_CLASS_MULTICOLOR y
-  require_config LEDS_IS31FL32XX y
-  require_config MTK_MT8163_BLUEZ_HCI y
-  # Full-parity board closure: PMIC/reset/RTC/input/sensors/LEDs plus the
-  # feature-payload and discovery primitives used by production services.
-  require_config MFD_MT6397 y
-  require_config REGULATOR_MT6323 y
-  require_config POWER_RESET_MT6323 y
-  require_config RTC_DRV_MT6397 y
-  require_config KEYBOARD_MTK_PMIC y
-  require_config PWM_MEDIATEK y
-  require_config NVMEM_MTK_EFUSE y
-  require_config IIO_ST_LSM6DSX y
-  require_config AMZ_PRIVACY y
-  require_config LEDS_MT6323 y
-  require_config FILE_LOCKING y
-  require_config INOTIFY_USER y
-  require_config IP_MULTICAST y
-  require_config BLK_DEV_LOOP y
-  require_config SQUASHFS_LZ4 y
+  if [[ "$KERNEL_ARCH" == arm ]]; then
+    require_config USB_CONFIGFS_RNDIS y
+    require_config PINCTRL_MT8163 y
+    require_config MTK_MT8163_CONSYS y
+    require_config MTK_COMBO_WIFI y
+    require_config LEDS_CLASS_MULTICOLOR y
+    require_config LEDS_IS31FL32XX y
+    require_config MTK_MT8163_BLUEZ_HCI y
+    # Full-parity board closure: PMIC/reset/RTC/input/sensors/LEDs plus the
+    # feature-payload and discovery primitives used by production services.
+    require_config MFD_MT6397 y
+    require_config REGULATOR_MT6323 y
+    require_config POWER_RESET_MT6323 y
+    require_config RTC_DRV_MT6397 y
+    require_config KEYBOARD_MTK_PMIC y
+    require_config PWM_MEDIATEK y
+    require_config NVMEM_MTK_EFUSE y
+    require_config IIO_ST_LSM6DSX y
+    require_config AMZ_PRIVACY y
+    require_config LEDS_MT6323 y
+    require_config FILE_LOCKING y
+    require_config INOTIFY_USER y
+    require_config IP_MULTICAST y
+    require_config BLK_DEV_LOOP y
+    require_config SQUASHFS_LZ4 y
+  else
+    # MT8167 has no MT8163 WMT/consys glue; its USB gadget is cdc-acm/cdc-ncm
+    # over the MTU3/MUSB HDRC block.  Lidar has no PMIC behind the PMIC
+    # wrapper (its DTS keeps pwrap disabled; the rails are the RT5739 and
+    # fixed regulators), so the wrapper driver is not required.
+    require_config USB_CONFIGFS_ACM y
+    require_config USB_CONFIGFS_NCM y
+    require_config REGULATOR_RT5739 y
+    require_config MT7668_SDIO y
+    require_config BT_MTKSDIO y
+    require_config AMZ_PRIVACY y
+    require_config LEDS_IS31FL32XX y
+    require_config FILE_LOCKING y
+    require_config INOTIFY_USER y
+    require_config IP_MULTICAST y
+    require_config BLK_DEV_LOOP y
+    require_config SQUASHFS_LZ4 y
+  fi
 else
   require_config USB_CONFIGFS y
   require_config USB_CONFIGFS_F_FS y
 fi
-require_config AEABI y
-if grep -qxF 'CONFIG_USB_MTK_HDRC=y' "$KERNEL_OUT/.config"; then
-  require_config OABI_COMPAT y
+if [[ "$KERNEL_ARCH" == arm ]]; then
+  require_config AEABI y
+  if grep -qxF 'CONFIG_USB_MTK_HDRC=y' "$KERNEL_OUT/.config"; then
+    require_config OABI_COMPAT y
+  fi
 fi
 if (( recovery_marker_kconfig )); then
   if [[ "$IMAGE_PROFILE" == development ]]; then
@@ -955,6 +1109,7 @@ if (( recovery_marker_kconfig )); then
     exit 1
   fi
 fi
+if [[ "$KERNEL_ARCH" == arm ]]; then
 # The Amazon MT8163 machine moved from the vendor 3.18 symbol to the
 # 6.1 SPI/topology symbols.  Require both the machine and its transport.
 require_any_config y MT_SND_SOC_8163_AMZN SND_SOC_MT8163_RADAR_PUFFIN
@@ -1040,6 +1195,11 @@ if [[ -f "$radar_machine_source" && -f "$radar_codec_header" &&
   require_source_marker "$radar_afe_source" \
     'AFE_I06_TO_O04' 'DL1 right AFE route'
 fi
+else
+  # MT8516/Lidar: the machine driver and its AFE live under mt8167 symbols.
+  require_config SND_SOC_MT8516 y
+  require_config SND_SOC_MT8516_AMAZON_LIDAR y
+fi
 
 if grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config" &&
    grep -q '^CONFIG_USB_FUNCTIONFS=' "$KERNEL_OUT/.config"; then
@@ -1047,7 +1207,7 @@ if grep -qxF 'CONFIG_USB_G_ANDROID=y' "$KERNEL_OUT/.config" &&
   exit 1
 fi
 
-echo "=== building ARM32 zImage and Radar-Puffin DTB (-j$JOBS) ==="
+echo "=== building $KERNEL_ARCH $KERNEL_IMAGE_NAME and $KERNEL_DTB_NAME (-j$JOBS) ==="
 # Pin the kernel's build identity (user, host, timestamp, build number) so
 # rebuilding the same commit with the same toolchain gives the same zImage.
 # Without this the version banner records the CI runner's hostname and the
@@ -1055,18 +1215,18 @@ echo "=== building ARM32 zImage and Radar-Puffin DTB (-j$JOBS) ==="
 kernel_build_epoch="$(git -C "$KERNEL_SRC" log -1 --format=%ct HEAD)"
 KBUILD_BUILD_USER=libreecho KBUILD_BUILD_HOST=libreecho KBUILD_BUILD_VERSION=1 \
 KBUILD_BUILD_TIMESTAMP="$(date -u -d "@$kernel_build_epoch" '+%a %b %e %H:%M:%S UTC %Y')" \
-make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm CROSS_COMPILE="$CROSS" \
-  LD="${CROSS}ld.bfd" -j"$JOBS" zImage "$KERNEL_DTB_NAME"
+make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH="$KERNEL_ARCH" CROSS_COMPILE="$KERNEL_CROSS" \
+  LD="${KERNEL_CROSS}ld.bfd" -j"$JOBS" "$KERNEL_IMAGE_NAME" "$KERNEL_DTB_TARGET"
 
-ZIMAGE_BUILD="$KERNEL_OUT/arch/arm/boot/zImage"
+ZIMAGE_BUILD="$KERNEL_OUT/$KERNEL_BOOT_SUBDIR/$KERNEL_IMAGE_NAME"
 SYSMAP_BUILD="$KERNEL_OUT/System.map"
-KERNEL_DTB="$KERNEL_OUT/arch/arm/boot/dts/$KERNEL_DTB_NAME"
+KERNEL_DTB="$KERNEL_OUT/$KERNEL_DTS_SUBDIR/$KERNEL_DTB_NAME"
 [[ -f "$ZIMAGE_BUILD" && -f "$SYSMAP_BUILD" && -f "$KERNEL_DTB" ]] || {
   echo "ERROR: kernel or DTB outputs missing" >&2; exit 1;
 }
-DTB_VERIFIER="$TOOLS_DIR/verify_${DTB_VERIFIER_ID}_dtb.py"
+DTB_VERIFIER="$IMAGE_TOOLS_DIR/verify_${DTB_VERIFIER_ID}_dtb.py"
 [[ -f "$DTB_VERIFIER" && ! -L "$DTB_VERIFIER" ]] || {
-  echo "ERROR: Radar-Puffin DTB verifier missing: $DTB_VERIFIER" >&2
+  echo "ERROR: target DTB verifier missing: $DTB_VERIFIER" >&2
   exit 1
 }
 python3 -B "$DTB_VERIFIER" --dtb "$KERNEL_DTB"
@@ -1143,12 +1303,12 @@ if [[ -n "$KERNEL_ZIMAGE_OVERRIDE" || -n "$KERNEL_SYSTEM_MAP_OVERRIDE" ]]; then
   [[ "$(sha256sum "$KERNEL_SYSTEM_MAP_OVERRIDE" | awk '{print $1}')" == "$KERNEL_SYSTEM_MAP_OVERRIDE_SHA256" ]] || {
     echo "ERROR: kernel System.map parity override hash mismatch" >&2; exit 1
   }
-  cp -- "$KERNEL_ZIMAGE_OVERRIDE" "$RUN/zImage"
+  cp -- "$KERNEL_ZIMAGE_OVERRIDE" "$RUN/$KERNEL_IMAGE_NAME"
   cp -- "$KERNEL_SYSTEM_MAP_OVERRIDE" "$RUN/System.map"
   zsha="$KERNEL_ZIMAGE_OVERRIDE_SHA256"
   mapsha="$KERNEL_SYSTEM_MAP_OVERRIDE_SHA256"
 else
-  cp -- "$ZIMAGE_BUILD" "$RUN/zImage"
+  cp -- "$ZIMAGE_BUILD" "$RUN/$KERNEL_IMAGE_NAME"
   cp -- "$SYSMAP_BUILD" "$RUN/System.map"
 fi
 cp -- "$KERNEL_DTB" "$RUN/$KERNEL_DTB_NAME"
@@ -2309,16 +2469,19 @@ run_id="$SHARED_RUN_ID"
 [[ "$TARGET" == "${selected_targets[0]}" ]] || run_id="$SHARED_RUN_ID-$TARGET"
 RUN="$RUNS/$run_id"
 COMPONENTS_MANIFEST="$RUN/components.json"
-BUILDER="$TOOLS_DIR/build_recovery_image.py"
-VERIFIER="$TOOLS_DIR/verify_recovery_image.py"
+BUILDER="$IMAGE_TOOLS_DIR/build_recovery_image.py"
+VERIFIER="$IMAGE_TOOLS_DIR/verify_recovery_image.py"
 IMAGE_DTB="$RUN/$KERNEL_DTB_NAME"
 IMAGE_DTB_SHA256="$dtbsha"
 echo "radar_puffin_dtb_sha256=$IMAGE_DTB_SHA256"
-echo "=== packaging canonical ARM32 recovery image ==="
 BOOT_ENVELOPE="$RUN/boot-envelope.bin"
+if [[ "$KERNEL_ARCH" == arm ]]; then
+echo "=== packaging canonical ARM32 recovery image ==="
 platform_args "$BOOT_ENVELOPE_GENERATOR"
 python3 -B "$BOOT_ENVELOPE_GENERATOR" "${TARGET_TOOL_ARGS[@]}" --output "$BOOT_ENVELOPE" | tee "$RUN/boot-envelope-build.log"
 platform_args "$BUILDER" --descriptor "$TARGET_DESCRIPTOR_SHA256"
+# --zimage and the manifest's zimage key are the kept contract names for the
+# kernel image slot; on arm64 they carry Image.
 python3 -B "$BUILDER" "${TARGET_TOOL_ARGS[@]}" \
   --boot-envelope "$BOOT_ENVELOPE" \
   --adbd "$ADBD_BINARY" --adbd-source-metadata "$ADBD_METADATA" \
@@ -2345,19 +2508,56 @@ python3 -B "$BUILDER" "${TARGET_TOOL_ARGS[@]}" \
   --wpa-source-metadata "$RUN/wpa-supplicant-source.json" \
   --wifi-config "$IMAGE_WIFI_CONFIG" \
   "${ssh_builder_args[@]}" \
-  --zimage "$RUN/zImage" --expected-zimage-sha256 "$zsha" \
+  --zimage "$RUN/$KERNEL_IMAGE_NAME" --expected-zimage-sha256 "$zsha" \
   --system-map "$RUN/System.map" --expected-system-map-sha256 "$mapsha" \
   --dtb "$IMAGE_DTB" --expected-dtb-sha256 "$IMAGE_DTB_SHA256" \
   --output "$RUN/boot.img" \
   --ramdisk-output "$RUN/boot.ramdisk.cpio.xz" \
   --manifest "$RUN/manifest.json" | tee "$RUN/build.log"
+else
+  echo "=== packaging canonical ARM64 Lidar recovery image ==="
+  # The MT8167 builder builds the MediaTek envelope, appends the 19 stock DTBs
+  # and rejects every MT8163-only payload flag, so none is passed.  The SSH
+  # bundle is not one of those: Lidar's userspace is the shared ARM32 tree, so
+  # the same opt-in dropbear/strict-scp bundle that the MT8163 image carries
+  # applies here unchanged.
+  BOOT_ENVELOPE=
+  platform_args "$BUILDER" --descriptor "$TARGET_DESCRIPTOR_SHA256"
+  python3 -B "$BUILDER" "${TARGET_TOOL_ARGS[@]}" \
+    --stock-boot "$LIDAR_STOCK_BOOT" \
+    --kernel-image "$RUN/$KERNEL_IMAGE_NAME" \
+    --kernel-config "$RUN/kernel.config" \
+    --dtb "$IMAGE_DTB" --expected-dtb-sha256 "$IMAGE_DTB_SHA256" \
+    --adbd "$ADBD_BINARY" --adbd-source-metadata "$ADBD_METADATA" \
+    --busybox "$BUSYBOX_OUTPUT/busybox" --expected-busybox-sha256 "$busybox_sha" \
+    --musl-loader "$MUSL_LOADER" --expected-musl-loader-sha256 "$musl_loader_sha" \
+    --image-profile "$IMAGE_PROFILE" --service-profile "$SERVICE_PROFILE" \
+    --update-channel "$UPDATE_CHANNEL" \
+    --feature-policy "$FEATURE_POLICY" \
+    --bootctl "$OTA_BOOTCTL" \
+    --update-verifier "$OTA_VERIFIER" --ota-public-key "$OTA_PUBLIC_KEY" \
+    --wifi-patch "$LIDAR_WIFI_PATCH" --wifi-licence "$LIDAR_WIFI_LICENCE" \
+    --tinyplay "$RUN/tinyplay" --tinycap "$RUN/tinycap" --tinymix "$RUN/tinymix" \
+    --wpa-supplicant "$WPA_SUPPLICANT" \
+    --ui-bundle "$UI_BUNDLE" --ui-source "$UI_SOURCE" \
+    --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
+    --mdns-runtime "$MDNS_RUNTIME_ROOT" \
+    "${ssh_builder_args[@]}" \
+    --output "$RUN/boot.img" \
+    --ramdisk-output "$RUN/boot.ramdisk.cpio.xz" \
+    --manifest "$RUN/manifest.json" | tee "$RUN/build.log"
+fi
 
 bootsha="$(sha256sum "$RUN/boot.img" | awk '{print $1}')"
 echo "=== independent image verification ==="
-platform_args "$VERIFIER"
-python3 -B "$VERIFIER" "${TARGET_TOOL_ARGS[@]}" \
+platform_args "$VERIFIER" --descriptor "$TARGET_DESCRIPTOR_SHA256"
+if [[ "$KERNEL_ARCH" == arm ]]; then
+  # The MT8163 WMT/connectivity bundle has no MT8167 equivalent; Lidar Wi-Fi
+  # and Bluetooth are MT7668 over SDIO.
+  connectivity_verifier_args=(--expected-connectivity-bundle mt8163-v181-stock-v1)
+  python3 -B "$VERIFIER" "${TARGET_TOOL_ARGS[@]}" \
   --boot-envelope "$BOOT_ENVELOPE" \
-  --zimage "$RUN/zImage" --expected-zimage-sha256 "$zsha" \
+  --zimage "$RUN/$KERNEL_IMAGE_NAME" --expected-zimage-sha256 "$zsha" \
   --system-map "$RUN/System.map" --expected-system-map-sha256 "$mapsha" \
   --ramdisk "$RUN/boot.ramdisk.cpio.xz" --manifest "$RUN/manifest.json" \
   --boot-image "$RUN/boot.img" --expected-boot-sha256 "$bootsha" \
@@ -2383,12 +2583,39 @@ python3 -B "$VERIFIER" "${TARGET_TOOL_ARGS[@]}" \
   --expected-ui-manifest-sha256 "$ui_manifest_sha" \
   --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
   "${ssh_verifier_args[@]}" \
-  --expected-connectivity-bundle mt8163-v181-stock-v1 | tee "$RUN/verify.log"
+  "${connectivity_verifier_args[@]}" | tee "$RUN/verify.log"
+else
+  python3 -B "$VERIFIER" "${TARGET_TOOL_ARGS[@]}" \
+    --stock-boot "$LIDAR_STOCK_BOOT" \
+    --kernel-image "$RUN/$KERNEL_IMAGE_NAME" \
+    --kernel-config "$RUN/kernel.config" \
+    --dtb "$IMAGE_DTB" --expected-dtb-sha256 "$IMAGE_DTB_SHA256" \
+    --ramdisk "$RUN/boot.ramdisk.cpio.xz" --manifest "$RUN/manifest.json" \
+    --boot-image "$RUN/boot.img" --expected-boot-sha256 "$bootsha" \
+    --expected-busybox-sha256 "$busybox_sha" \
+    --expected-musl-loader-sha256 "$musl_loader_sha" \
+    --expected-tinyplay-sha256 "$tinyplay_sha" \
+    --expected-tinycap-sha256 "$tinycap_sha" \
+    --expected-tinymix-sha256 "$tinymix_sha" \
+    --expected-wpa-supplicant-sha256 "$wpa_supplicant_sha" \
+    --expected-mdns-runtime-manifest-sha256 "$MDNS_RUNTIME_MANIFEST_SHA256" \
+    --image-profile "$IMAGE_PROFILE" \
+    --service-profile "$SERVICE_PROFILE" \
+    --feature-policy "$FEATURE_POLICY" \
+    --update-channel "$UPDATE_CHANNEL" \
+    --expected-bootctl-sha256 "$ota_bootctl_sha" \
+    --expected-update-verifier-sha256 "$ota_verifier_sha" \
+    --expected-ota-public-key-sha256 "$ota_public_key_sha" \
+    --expected-ui-manifest-sha256 "$ui_manifest_sha" \
+    --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
+    "${ssh_verifier_args[@]}" \
+    | tee "$RUN/verify.log"
+fi
 
 USERDATA_TREE=
 userdata_manifest_sha=
 userdata_tree_bytes=
-if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+if [[ "$FEATURES_ENABLED" == 1 && "$SOURCE_OFFERS_MODE" == 1 ]]; then
   USERDATA_TREE="$RUN/userdata-tree"
   echo "=== preparing clean production userdata tree ==="
   "$PIPELINE/prepare_userdata_tree.sh" "$RUN" "$USERDATA_TREE" | tee "$RUN/userdata-tree-build.log"
@@ -2396,14 +2623,16 @@ if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
   userdata_tree_bytes="$(du -s -B1 "$USERDATA_TREE" | awk '{print $1}')"
   echo "userdata_tree_manifest_sha256=$userdata_manifest_sha"
   echo "userdata_tree_bytes=$userdata_tree_bytes"
-else
+elif [[ "$PUBLIC_RELEASE_MODE" == 1 ]]; then
   echo "=== feature userdata excluded by public base policy ==="
+else
+  echo "=== feature userdata excluded by LIBREECHO_SOURCE_OFFERS=0 ==="
 fi
 
 source_offer_index=
 source_offer_manifest_sha256=
 source_offer_archives=()
-if [[ "$FEATURES_ENABLED" == 1 && "$PUBLIC_RELEASE_MODE" != 1 ]]; then
+if [[ "$FEATURES_ENABLED" == 1 && "$SOURCE_OFFERS_MODE" == 1 ]]; then
   echo "=== snapshotting immutable run-local source-offer relink inputs ==="
   SOURCE_OFFER_RELINK_STAGE="$RUN/source-offer-relink-stage"
   SOURCE_OFFER_RELINK_ROOT="$RUN/components/source-offer-relink"
@@ -2490,6 +2719,7 @@ if [[ "$OTA_FORMAT" == v3 ]]; then
   feature_candidate_catalog="$RUN/feature-candidate-catalog.json"
   feature_plan="$RUN/feature-plan.json"
   feature_asset_inventory="$RUN/feature-assets.json"
+  if [[ "$KERNEL_ARCH" == arm ]]; then
   python3 - "$RUN/manifest.json" "$feature_candidate_catalog" \
     airplay2 "$AIRPLAY_PAYLOAD" "$AIRPLAY_FEATURE_MANIFEST" \
     tts "$TTS_PAYLOAD" "$TTS_FEATURE_MANIFEST" \
@@ -2526,6 +2756,42 @@ catalog = {"features": features}
 if target != "radar_puffin": catalog["board"] = target
 output_path.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+  else
+  # Lidar feature payloads are OTA-only: the boot image manifest carries no
+  # feature records, so the catalog is built from the payload/manifest pairs.
+  python3 - "$feature_candidate_catalog" "$TARGET" \
+    airplay2 "$AIRPLAY_PAYLOAD" "$AIRPLAY_FEATURE_MANIFEST" \
+    tts "$TTS_PAYLOAD" "$TTS_FEATURE_MANIFEST" \
+    wakeword "$WAKE_PAYLOAD" "$WAKE_FEATURE_MANIFEST" \
+    stt "$STT_PAYLOAD" "$STT_FEATURE_MANIFEST" \
+    assistant "$ASSISTANT_PAYLOAD" "$ASSISTANT_FEATURE_MANIFEST" <<'PY'
+import hashlib, json, pathlib, sys
+output_path = pathlib.Path(sys.argv[1])
+target = sys.argv[2]
+args = sys.argv[3:]
+catalog = {"board": target, "features": {}}
+for offset in range(0, len(args), 3):
+    feature, payload_name, manifest_name = args[offset:offset + 3]
+    payload = pathlib.Path(payload_name)
+    manifest_path = pathlib.Path(manifest_name)
+    if (payload.is_symlink() or not payload.is_file() or
+            manifest_path.is_symlink() or not manifest_path.is_file()):
+        raise SystemExit(f"ERROR: Lidar feature payload is missing: {feature}")
+    identity = json.loads(manifest_path.read_text(encoding="utf-8"))
+    named = identity.get("payload")
+    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+    if (not isinstance(named, dict) or named.get("filename") != payload.name or
+            named.get("sha256") != digest or named.get("size") != payload.stat().st_size):
+        raise SystemExit(f"ERROR: Lidar feature payload/manifest identity mismatch: {feature}")
+    catalog["features"][feature] = {
+        "payload": {"path": str(payload.resolve()), "sha256": digest, "size": payload.stat().st_size},
+        "manifest": {"path": str(manifest_path.resolve()),
+                     "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                     "size": manifest_path.stat().st_size},
+    }
+output_path.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  fi
   python3 -B "$PIPELINE/ci/plan-target-manifest.py" \
     --target "$TARGET" --candidate-catalog "$feature_candidate_catalog" \
     --boot-image "$RUN/boot.img" --release "$OTA_TARGET_RELEASE_TAG" \
@@ -2571,6 +2837,24 @@ component_timing_sha="$(sha256sum "$RUN/component-timing.log" | awk '{print $1}'
 component_identities_sha="$(sha256sum "$RUN/component-identities.log" | awk '{print $1}')"
 components_manifest_sha="$(sha256sum "$COMPONENTS_MANIFEST" | awk '{print $1}')"
 
+boot_envelope_record=
+lidar_image_record=
+if [[ "$KERNEL_ARCH" == arm ]]; then
+  boot_envelope_record="boot_envelope=$BOOT_ENVELOPE
+boot_envelope_sha256=$(sha256sum "$BOOT_ENVELOPE" | awk '{print $1}')"
+else
+  # The stock boot stays owner-only: only its identity is recorded, and the
+  # builder reads it in place rather than copying it into the run.
+  lidar_wifi_patch_sha="$(sha256sum "$LIDAR_WIFI_PATCH" | awk '{print $1}')"
+  lidar_wifi_licence_sha="$(sha256sum "$LIDAR_WIFI_LICENCE" | awk '{print $1}')"
+  lidar_image_record="lidar_stock_boot=$LIDAR_STOCK_BOOT
+lidar_stock_boot_sha256=$stock_boot_sha
+lidar_wifi_patch=$LIDAR_WIFI_PATCH
+lidar_wifi_patch_sha256=$lidar_wifi_patch_sha
+lidar_wifi_licence=$LIDAR_WIFI_LICENCE
+lidar_wifi_licence_sha256=$lidar_wifi_licence_sha"
+fi
+
 cat > "$RUN/provenance.txt" <<EOF
 schema=1
 board=$TARGET
@@ -2601,14 +2885,14 @@ kernel_git_diff_sha256=$kernel_diffsha
 kernel_config=$RUN/kernel.config
 kernel_config_sha256=$kernel_config_sha
 expected_dtb_sha256=$IMAGE_DTB_SHA256
-zimage=$RUN/zImage
+zimage=$RUN/$KERNEL_IMAGE_NAME
 zimage_sha256=$zsha
 system_map=$RUN/System.map
 system_map_sha256=$mapsha
 boot_image=$RUN/boot.img
 boot_image_sha256=$bootsha
-boot_envelope=$BOOT_ENVELOPE
-boot_envelope_sha256=$(sha256sum "$BOOT_ENVELOPE" | awk '{print $1}')
+$boot_envelope_record
+$lidar_image_record
 components_manifest=$COMPONENTS_MANIFEST
 components_manifest_sha256=$components_manifest_sha
 component_timing=$RUN/component-timing.log
@@ -2735,8 +3019,8 @@ expected_dtb_sha256=$IMAGE_DTB_SHA256
 run_dir=$RUN
 boot_image=$RUN/boot.img
 boot_image_sha256=$bootsha
-boot_envelope=$BOOT_ENVELOPE
-boot_envelope_sha256=$(sha256sum "$BOOT_ENVELOPE" | awk '{print $1}')
+$boot_envelope_record
+$lidar_image_record
 components_manifest=$COMPONENTS_MANIFEST
 components_manifest_sha256=$components_manifest_sha
 component_timing=$RUN/component-timing.log
@@ -2809,7 +3093,7 @@ ssh_enabled=$SSH_ENABLED
 dropbear_sha256=$dropbear_sha
 dropbearkey_sha256=$dropbearkey_sha
 scp_sha256=$scp_sha
-zimage=$RUN/zImage
+zimage=$RUN/$KERNEL_IMAGE_NAME
 zimage_sha256=$zsha
 system_map=$RUN/System.map
 system_map_sha256=$mapsha

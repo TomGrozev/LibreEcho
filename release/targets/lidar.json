@@ -1,0 +1,32 @@
+{
+  "schema": "libreecho-target-v1",
+  "soc": "mt8167",
+  "arch": "arm64",
+  "kernel": {
+    "defconfig": "mt8167_arm64_defconfig",
+    "dtb": "libreecho-lidar.dtb"
+  },
+  "layout_profiles": [
+    "kaeru"
+  ],
+  "features": [
+    "airplay2",
+    "assistant",
+    "stt",
+    "tts",
+    "wakeword"
+  ],
+  "hardware_accepted": false,
+  "target_id": "lidar",
+  "release_slug": "lidar",
+  "display_name": "Amazon Echo Plus (2nd Gen)",
+  "fastboot_products": [
+    "LIDAR"
+  ],
+  "platform": {
+    "tools_profile": "mt8167-arm64",
+    "userspace_tools_profile": "mt8163-arm32",
+    "dtb_verifier": "lidar",
+    "hw_profile": "lidar@1"
+  }
+}

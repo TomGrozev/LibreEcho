@@ -49,7 +49,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 LOCK_SCHEMA = "libreecho-armhf-cross-toolchain-lock/1"
@@ -60,6 +64,41 @@ RECEIPT_NAME = ".libreecho-armhf-toolchain-receipt.json"
 TARGET = "arm-linux-gnueabihf"
 CROSS_PREFIX_NAME = TARGET + "-"
 LD_PATH = "usr/lib/x86_64-linux-gnu"
+
+
+@dataclass(frozen=True)
+class Family:
+    """One pinned cross-toolchain family sharing this materializer/verifier.
+
+    Every schema, receipt name and consumer path is family-scoped so a second
+    architecture cannot accept or overwrite the first family's prefix.  The
+    module constants above remain the ARMHF family for existing callers.
+    """
+
+    name: str
+    lock_schema: str
+    receipt_schema: str
+    tree_schema: str
+    receipt_name: str
+    target: str
+    cross_prefix_name: str
+    ld_path: str
+    generator: str
+    stage_prefix: str
+
+
+ARMHF = Family(
+    name="armhf",
+    lock_schema=LOCK_SCHEMA,
+    receipt_schema=RECEIPT_SCHEMA,
+    tree_schema=TREE_SCHEMA,
+    receipt_name=RECEIPT_NAME,
+    target=TARGET,
+    cross_prefix_name=CROSS_PREFIX_NAME,
+    ld_path=LD_PATH,
+    generator="build/ci/armhf_toolchain.py",
+    stage_prefix=".armhf-toolchain-stage-",
+)
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9A-Fa-f]{40}$")   # signing-key fingerprints carry case
@@ -72,6 +111,7 @@ MAX_PREFIX_BYTES = 4 << 30           # 4 GiB total extracted content
 MAX_PATH_DEPTH = 64
 MAX_PATH_LENGTH = 4096
 ZSTD_TIMEOUT = 300
+DOWNLOAD_CHUNK = 1 << 20            # stream archives; never buffer a whole deb
 
 # Control fields that must be present and consistent for every archive.
 _DEB_MAGIC = b"!<arch>\n"
@@ -225,7 +265,7 @@ def _reject_absolute(value: str, label: str) -> None:
         raise ToolchainError(f"{label} must not be an absolute path: {value!r}")
 
 
-def load_lock(path) -> dict:
+def load_lock(path, *, family: Family = ARMHF) -> dict:
     """Validate the committed lock; any deviation fails closed."""
     path = Path(path)
     if path.is_symlink() or not path.is_file():
@@ -234,7 +274,7 @@ def load_lock(path) -> dict:
         document = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ToolchainError(f"toolchain lock is not valid JSON: {exc}")
-    if not isinstance(document, dict) or document.get("schema") != LOCK_SCHEMA:
+    if not isinstance(document, dict) or document.get("schema") != family.lock_schema:
         raise ToolchainError("unsupported toolchain lock schema")
     archives = document.get("archives")
     if not isinstance(archives, list) or not archives:
@@ -373,7 +413,7 @@ def _resolve_link_target(name: str, target) -> str:
     return resolved
 
 
-def extract_deb_data(deb_path, root, *, state=None) -> dict:
+def extract_deb_data(deb_path, root, *, state=None, family: Family = ARMHF) -> dict:
     """Extract only ``data.tar.*`` into ``root`` under a fail-closed member filter.
 
     Directory members merge (legitimate cross-package overlap); a file or
@@ -396,7 +436,7 @@ def extract_deb_data(deb_path, root, *, state=None) -> dict:
             relative = _normalize_member_name(member.name)
             if relative is None:
                 continue
-            if relative == RECEIPT_NAME:
+            if relative == family.receipt_name:
                 raise ToolchainError("archive attempts to ship the receipt path")
             if member.type not in _ALLOWED_MEMBER_TYPES:
                 raise ToolchainError(
@@ -484,7 +524,7 @@ def _entry_type(path: Path) -> str:
     raise ToolchainError(f"prefix contains a special file: {path}")
 
 
-def tree_manifest(root, *, exclude=(), root_is_held=False) -> dict:
+def tree_manifest(root, *, exclude=(), root_is_held=False, family: Family = ARMHF) -> dict:
     """Derive a canonical, checkout-independent identity over a prefix tree.
 
     ``root_is_held`` marks ``root`` as a ``/proc/self/fd/<dirfd>`` adapter for a
@@ -501,7 +541,7 @@ def tree_manifest(root, *, exclude=(), root_is_held=False) -> dict:
     exclude = set(exclude)
     entries = []
     digest = hashlib.sha256()
-    digest.update((TREE_SCHEMA + "\n").encode())
+    digest.update((family.tree_schema + "\n").encode())
     counts = {"files": 0, "directories": 0, "symlinks": 0}
     for current, dirnames, filenames in os.walk(root, followlinks=False):
         names = sorted(dirnames + filenames)
@@ -534,7 +574,7 @@ def tree_manifest(root, *, exclude=(), root_is_held=False) -> dict:
     if not entries:
         raise ToolchainError(f"prefix tree is empty: {root}")
     entries.sort(key=lambda item: item["path"])
-    return {"schema": TREE_SCHEMA, "sha256": digest.hexdigest(), "entries": entries, **counts}
+    return {"schema": family.tree_schema, "sha256": digest.hexdigest(), "entries": entries, **counts}
 
 
 def compare_manifests(expected: dict, actual: dict) -> None:
@@ -577,12 +617,12 @@ def _assert_no_absolute_paths(value, label="receipt") -> None:
             _assert_no_absolute_paths(item, label)
 
 
-def build_receipt(lock_path, identities, manifest) -> dict:
+def build_receipt(lock_path, identities, manifest, *, family: Family = ARMHF) -> dict:
     return {
-        "schema": RECEIPT_SCHEMA,
+        "schema": family.receipt_schema,
         "lock_sha256": sha256_file(lock_path),
-        "target": TARGET,
-        "generated_by": "build/ci/armhf_toolchain.py",
+        "target": family.target,
+        "generated_by": family.generator,
         "archives": [
             {"name": item["name"], "version": item["version"],
              "architecture": item["architecture"], "sha256": item["sha256"],
@@ -599,16 +639,16 @@ def build_receipt(lock_path, identities, manifest) -> dict:
     }
 
 
-def load_receipt(prefix, *, lock_path, identities) -> dict:
+def load_receipt(prefix, *, lock_path, identities, family: Family = ARMHF) -> dict:
     """Validate the receipt binds this lock, these archives and this tree."""
-    path = Path(prefix) / RECEIPT_NAME
+    path = Path(prefix) / family.receipt_name
     if path.is_symlink() or not path.is_file():
         raise ToolchainError("prefix is missing its materialization receipt")
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ToolchainError(f"receipt is not valid JSON: {exc}")
-    if not isinstance(receipt, dict) or receipt.get("schema") != RECEIPT_SCHEMA:
+    if not isinstance(receipt, dict) or receipt.get("schema") != family.receipt_schema:
         raise ToolchainError("unsupported receipt schema")
     _assert_no_absolute_paths(receipt)
     if receipt.get("lock_sha256") != sha256_file(lock_path):
@@ -619,7 +659,7 @@ def load_receipt(prefix, *, lock_path, identities) -> dict:
     if receipt.get("archives") != expected:
         raise ToolchainError("receipt archive identities do not match the archives")
     tree = receipt.get("tree")
-    if not isinstance(tree, dict) or tree.get("schema") != TREE_SCHEMA:
+    if not isinstance(tree, dict) or tree.get("schema") != family.tree_schema:
         raise ToolchainError("receipt tree identity is malformed")
     if not HEX64.fullmatch(str(tree.get("sha256", ""))):
         raise ToolchainError("receipt tree digest is malformed")
@@ -846,7 +886,7 @@ def _is_detached(destination: Path, parent_fd: int, dest_name: str) -> bool:
 # Stage and verify
 # --------------------------------------------------------------------------
 
-def stage(lock_path, archive_dir, prefix) -> dict:
+def stage(lock_path, archive_dir, prefix, *, family: Family = ARMHF) -> dict:
     """Pre-validate, extract, receipt, and atomically publish an offline prefix.
 
     The destination parent is opened as a held ``O_DIRECTORY|O_NOFOLLOW``
@@ -859,11 +899,11 @@ def stage(lock_path, archive_dir, prefix) -> dict:
     is reported via ``detached=True`` rather than presented as the requested
     replacement.
     """
-    lock = load_lock(lock_path)
+    lock = load_lock(lock_path, family=family)
     identities = verify_archives(lock, archive_dir)
     destination = Path(prefix)
     parent_fd, dest_name, held, created = _open_confined_parent(destination)
-    stage_name = ".armhf-toolchain-stage-" + secrets.token_hex(8)
+    stage_name = family.stage_prefix + secrets.token_hex(8)
     stage_fd = None
     stage_owned = None
     stage_created = False
@@ -882,15 +922,15 @@ def stage(lock_path, archive_dir, prefix) -> dict:
         for record in sorted(lock["archives"],
                              key=lambda r: (r["name"], r["architecture"], r["version"])):
             extract_deb_data(Path(archive_dir) / record["filename"], stage_root,
-                             state=state)
+                             state=state, family=family)
         os.fchmod(stage_fd, 0o755)
-        manifest = tree_manifest(stage_root, root_is_held=True)
-        receipt = build_receipt(lock_path, identities, manifest)
-        if _lexists_at(stage_fd, RECEIPT_NAME):
+        manifest = tree_manifest(stage_root, root_is_held=True, family=family)
+        receipt = build_receipt(lock_path, identities, manifest, family=family)
+        if _lexists_at(stage_fd, family.receipt_name):
             raise ToolchainError("staging directory already carries a receipt")
         data = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
         receipt_fd = os.open(
-            RECEIPT_NAME,
+            family.receipt_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
             dir_fd=stage_fd)
         try:
@@ -951,28 +991,30 @@ def stage(lock_path, archive_dir, prefix) -> dict:
             "receipt": receipt, "detached": detached}
 
 
-def _expected_tree(lock, archive_dir, parent: Path) -> dict:
-    work = Path(tempfile.mkdtemp(prefix=".armhf-toolchain-verify-", dir=str(parent)))
+def _expected_tree(lock, archive_dir, parent: Path, *, family: Family = ARMHF) -> dict:
+    work = Path(tempfile.mkdtemp(prefix=family.stage_prefix + "verify-", dir=str(parent)))
     try:
         state = {"paths": {}, "bytes": 0}
         for record in sorted(lock["archives"],
                              key=lambda r: (r["name"], r["architecture"], r["version"])):
-            extract_deb_data(Path(archive_dir) / record["filename"], work, state=state)
-        return tree_manifest(work)
+            extract_deb_data(Path(archive_dir) / record["filename"], work,
+                             state=state, family=family)
+        return tree_manifest(work, family=family)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def verify(lock_path, archive_dir, prefix) -> dict:
+def verify(lock_path, archive_dir, prefix, *, family: Family = ARMHF) -> dict:
     """Re-derive the expected tree from the archives and check the prefix against it."""
-    lock = load_lock(lock_path)
+    lock = load_lock(lock_path, family=family)
     identities = verify_archives(lock, archive_dir)
     prefix = Path(prefix)
     if prefix.is_symlink() or not prefix.is_dir():
         raise ToolchainError(f"prefix is missing or unsafe: {prefix}")
-    receipt = load_receipt(prefix, lock_path=lock_path, identities=identities)
-    expected = _expected_tree(lock, archive_dir, prefix.parent)
-    actual = tree_manifest(prefix, exclude={RECEIPT_NAME})
+    receipt = load_receipt(prefix, lock_path=lock_path, identities=identities,
+                           family=family)
+    expected = _expected_tree(lock, archive_dir, prefix.parent, family=family)
+    actual = tree_manifest(prefix, exclude={family.receipt_name}, family=family)
     compare_manifests(expected, actual)
     if receipt["tree"]["sha256"] != expected["sha256"]:
         raise ToolchainError("receipt tree digest does not match the archive-derived tree")
@@ -984,19 +1026,78 @@ def verify(lock_path, archive_dir, prefix) -> dict:
             "directories": expected["directories"], "symlinks": expected["symlinks"]}
 
 
-def prefix_env(prefix) -> dict:
+def prefix_env(prefix, *, family: Family = ARMHF) -> dict:
     """The consumer contract for a staged prefix; no shell eval is required."""
     prefix = str(prefix)
     return {
         "SYSROOT": prefix,
-        "CROSS_PREFIX": prefix + "/usr/bin/" + CROSS_PREFIX_NAME,
-        "LD_LIBRARY_PATH": prefix + "/" + LD_PATH,
+        "CROSS_PREFIX": prefix + "/usr/bin/" + family.cross_prefix_name,
+        "LD_LIBRARY_PATH": prefix + "/" + family.ld_path,
     }
 
 
-def main(argv=None) -> int:
+def fetch(lock_path, archive_dir, *, family: Family = ARMHF,
+          attempts: int = 3) -> list:
+    """Download every locked archive and re-hash it; never returns unverified bytes.
+
+    ``fetch`` is the only network operation in this module.  It writes into a
+    caller-supplied directory, verifies each archive immediately after the
+    download (and again in one final pass), and removes a file whose bytes do
+    not match the lock so a retry cannot silently reuse it.
+    """
+    lock = load_lock(lock_path, family=family)
+    archive_dir = Path(archive_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for record in sorted(lock["archives"], key=lambda r: r["filename"]):
+        destination = archive_dir / record["filename"]
+        if destination.is_file() and not destination.is_symlink():
+            if (destination.stat().st_size == record["size"]
+                    and sha256_file(destination) == record["sha256"]):
+                continue
+            destination.unlink()
+        part = destination.with_name(destination.name + ".part")
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            try:
+                digest = hashlib.sha256()
+                written = 0
+                with urllib.request.urlopen(record["url"], timeout=300) as response:
+                    with open(part, "wb") as handle:
+                        while True:
+                            chunk = response.read(DOWNLOAD_CHUNK)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            digest.update(chunk)
+                            written += len(chunk)
+                if written != record["size"] or digest.hexdigest() != record["sha256"]:
+                    raise ToolchainError(
+                        f"downloaded archive does not match the lock: {record['filename']}")
+                os.replace(part, destination)
+                last_error = None
+                break
+            except (ToolchainError, urllib.error.URLError, OSError, TimeoutError) as exc:
+                last_error = exc
+            finally:
+                # Also runs for KeyboardInterrupt: no half-written archive survives.
+                if part.exists():
+                    part.unlink()
+            if attempt < attempts:
+                time.sleep(2 * attempt)
+        if last_error is not None:
+            raise ToolchainError(
+                f"archive download failed after {attempts} attempts: {record['filename']} ({last_error})")
+    return verify_archives(lock, archive_dir)
+
+
+def main(argv=None, *, family: Family = ARMHF) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+
+    fetch_parser = commands.add_parser(
+        "fetch", help="download every locked archive and verify its hash")
+    fetch_parser.add_argument("--lock", type=Path, required=True)
+    fetch_parser.add_argument("--archives", type=Path, required=True)
 
     stage_parser = commands.add_parser("stage", help="materialize the prefix offline")
     stage_parser.add_argument("--lock", type=Path, required=True)
@@ -1013,22 +1114,27 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "fetch":
+            identities = fetch(args.lock, args.archives, family=family)
+            print(f"{family.name}_toolchain_fetch=PASS archives=%d"
+                  % len(identities))
+            return 0
         if args.command == "stage":
-            result = stage(args.lock, args.archives, args.prefix)
+            result = stage(args.lock, args.archives, args.prefix, family=family)
             if result.get("detached"):
                 print("WARNING: published into a directory detached from the "
                       "requested path (a destination ancestor changed during "
                       "materialization); the requested path is NOT claimed to "
                       "hold the prefix: %s" % result["prefix"], file=sys.stderr)
-            print("armhf_toolchain_stage=PASS archives=%d prefix=%s lock_sha256=%s"
+            print(f"{family.name}_toolchain_stage=PASS archives=%d prefix=%s lock_sha256=%s"
                   % (result["archives"], result["prefix"], result["receipt"]["lock_sha256"]))
             return 0
         if args.command == "verify":
-            result = verify(args.lock, args.archives, args.prefix)
-            print("armhf_toolchain_verify=PASS archives=%d tree_sha256=%s files=%d"
+            result = verify(args.lock, args.archives, args.prefix, family=family)
+            print(f"{family.name}_toolchain_verify=PASS archives=%d tree_sha256=%s files=%d"
                   % (result["archives"], result["tree_sha256"], result["files"]))
             return 0
-        for key, value in prefix_env(args.prefix).items():
+        for key, value in prefix_env(args.prefix, family=family).items():
             print(f"{key}={value}")
         return 0
     except (ToolchainError, json.JSONDecodeError, OSError) as error:

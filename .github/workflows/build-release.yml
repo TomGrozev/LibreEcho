@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: Comma-separated known targets (radar_puffin or radar_puffin,biscuit)
+        description: Comma-separated known targets (for example radar_puffin or radar_puffin,biscuit)
         required: true
         default: radar_puffin
         type: string
@@ -315,6 +315,7 @@ jobs:
           set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python -B -m unittest -v \
             build.tests.test_component_cache \
+            build.tests.test_aarch64_toolchain \
             build.tests.test_prepare_dev_release \
             build.tests.test_fetch_ota_base \
             build.tests.test_release_completeness \
@@ -324,6 +325,7 @@ jobs:
             build.tests.test_publish_dev_pointer \
             build.tests.test_publish_v3_pointer \
             build.tests.test_target_manifest \
+            build.tests.test_target_descriptor_tools_profile \
             build.tests.test_ota_v3_release \
             build.tests.test_ota_v2_signing \
             build.tests.test_ota_v2_complete_gate \
@@ -354,6 +356,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       armhf_root_digest: ${{ steps.armhf-pkg.outputs.armhf_root_digest }}
+      aarch64_root_digest: ${{ steps.aarch64-pkg.outputs.aarch64_root_digest }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with: {fetch-depth: 1, persist-credentials: false}
@@ -465,6 +468,50 @@ jobs:
             done | LC_ALL=C sort -u | sha256sum | awk '{print $1}'
           )"
           printf 'armhf_root_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      # The aarch64 kernel cross is fetched from its authenticated lock, never
+      # from the runner's apt state. Only the kernel uses it; every userspace
+      # binary stays on the ARMHF cross above.
+      - name: Restore pinned aarch64 kernel cross cache
+        id: restore-aarch64
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: |
+            ${{ runner.temp }}/aarch64-root
+            ${{ runner.temp }}/aarch64-debs
+          key: libreecho-aarch64-cross-v1-${{ runner.os }}-${{ hashFiles('build/inputs/aarch64-cross-toolchain.lock.json') }}
+      - name: Fetch and stage pinned aarch64 kernel cross
+        if: steps.restore-aarch64.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python3 build/ci/aarch64_toolchain.py fetch \
+            --lock build/inputs/aarch64-cross-toolchain.lock.json \
+            --archives "$RUNNER_TEMP/aarch64-debs"
+          python3 build/ci/aarch64_toolchain.py stage \
+            --lock build/inputs/aarch64-cross-toolchain.lock.json \
+            --archives "$RUNNER_TEMP/aarch64-debs" \
+            --prefix "$RUNNER_TEMP/aarch64-root"
+      - name: Verify pinned aarch64 kernel cross
+        id: aarch64-pkg
+        run: |
+          set -euo pipefail
+          # Runs on cold and restored paths: a cache hit is re-derived from the
+          # cached archives and checked against the receipt before use.
+          python3 build/ci/aarch64_toolchain.py verify \
+            --lock build/inputs/aarch64-cross-toolchain.lock.json \
+            --archives "$RUNNER_TEMP/aarch64-debs" \
+            --prefix "$RUNNER_TEMP/aarch64-root"
+          printf 'aarch64_root_digest=%s\n' \
+            "$(sha256sum "$RUNNER_TEMP/aarch64-root/.libreecho-aarch64-toolchain-receipt.json" | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+      - name: Save pinned aarch64 kernel cross cache
+        if: success() && steps.restore-aarch64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: |
+            ${{ runner.temp }}/aarch64-root
+            ${{ runner.temp }}/aarch64-debs
+          key: libreecho-aarch64-cross-v1-${{ runner.os }}-${{ hashFiles('build/inputs/aarch64-cross-toolchain.lock.json') }}
 
       # --- Layer 2: musl toolchain, keyed by its pinned source commit and ---
       # --- builder script. ~14 min build; restored in seconds on a hit.  ---
@@ -604,6 +651,11 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
+          name: aarch64-root-${{ needs.resolve-and-preflight.outputs.source_set_id }}
+          path: ${{ runner.temp }}/aarch64-root
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
           name: mdns-packages-${{ needs.resolve-and-preflight.outputs.source_set_id }}
           path: ${{ runner.temp }}/mdns-packages
           if-no-files-found: error
@@ -673,6 +725,10 @@ jobs:
         with:
           name: armhf-root-${{ needs.resolve-and-preflight.outputs.source_set_id }}
           path: ${{ runner.temp }}/armhf-root
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: aarch64-root-${{ needs.resolve-and-preflight.outputs.source_set_id }}
+          path: ${{ runner.temp }}/aarch64-root
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
           name: mdns-packages-${{ needs.resolve-and-preflight.outputs.source_set_id }}
@@ -1142,12 +1198,21 @@ jobs:
         id: kernel-key
         run: |
           set -euo pipefail
-          compiler_sha="$(sha256sum "$RUNNER_TEMP/armhf-root/usr/bin/arm-linux-gnueabihf-gcc-13" | awk '{print $1}')"
-          printf 'kernel_key=libreecho-kernel-out-v2-parity-radar_puffin-biscuit-%s-%s-%s-%s\n' \
+          first_target="$(python3 -c 'import os,sys; print((os.environ.get("LIBREECHO_TARGETS") or "radar_puffin").split(",")[0])')"
+          eval "$(python3 build/ci/validate-targets.py --targets "$first_target" --shell)"
+          if [[ "$KERNEL_ARCH" == arm64 ]]; then
+            compiler_sha="$(sha256sum "$RUNNER_TEMP/aarch64-root/usr/bin/aarch64-linux-gnu-gcc-13" | awk '{print $1}')"
+            cross_digest="${{ needs.prepare-public-inputs.outputs.aarch64_root_digest }}"
+          else
+            compiler_sha="$(sha256sum "$RUNNER_TEMP/armhf-root/usr/bin/arm-linux-gnueabihf-gcc-13" | awk '{print $1}')"
+            cross_digest="${{ needs.prepare-public-inputs.outputs.armhf_root_digest }}"
+          fi
+          printf 'kernel_key=libreecho-kernel-out-v2-parity-%s-%s-%s-%s-%s\n' \
+            "${{ inputs.targets || 'radar_puffin' }}" \
             "${{ needs.resolve-and-preflight.outputs.linux_sha }}" \
             "$compiler_sha" \
-            "$(sha256sum sources/linux/arch/arm/configs/mt8163_arm32_defconfig | awk '{print $1}')" \
-            "${{ needs.prepare-public-inputs.outputs.armhf_root_digest }}-${{ hashFiles('release/targets/*.json') }}" \
+            "$(sha256sum "sources/linux/arch/$KERNEL_ARCH/configs/$KERNEL_DEFCONFIG" | awk '{print $1}')" \
+            "$cross_digest-${{ hashFiles('release/targets/*.json') }}" \
             >> "$GITHUB_OUTPUT"
       - name: Restore kernel object cache
         id: restore-kernel
@@ -1239,7 +1304,7 @@ jobs:
           # The staged ARMHF gcc/as/ld are dynamically linked against the
           # -armhf binutils libs inside the extracted root; the runner host
           # does not ship them. host-bin carries libfdt.so.1 for fdtget.
-          LD_LIBRARY_PATH: ${{ runner.temp }}/armhf-root/usr/lib/x86_64-linux-gnu:${{ runner.temp }}/host-bin
+          LD_LIBRARY_PATH: ${{ runner.temp }}/armhf-root/usr/lib/x86_64-linux-gnu:${{ runner.temp }}/aarch64-root/usr/lib/x86_64-linux-gnu:${{ runner.temp }}/host-bin
           LIBREECHO_PUBLIC_DEPS_ROOT: ${{ runner.temp }}/public-deps
           LIBREECHO_KERNEL_SRC: ${{ github.workspace }}/sources/linux
           LIBREECHO_TOOLING_SRC: ${{ github.workspace }}/sources/platform
@@ -1261,6 +1326,7 @@ jobs:
           LIBREECHO_CORE_RUNTIME_SYSROOT: ${{ runner.temp }}/armhf-root/usr/arm-linux-gnueabihf
           LIBREECHO_CORE_GCC_LIBDIR: ${{ runner.temp }}/armhf-root/usr/lib/gcc-cross/arm-linux-gnueabihf/13
           CROSS: ${{ runner.temp }}/armhf-root/usr/bin/arm-linux-gnueabihf-
+          LIBREECHO_AARCH64_CROSS: ${{ runner.temp }}/aarch64-root/usr/bin/aarch64-linux-gnu-
           AUDIO_CC: ${{ runner.temp }}/toolchain/usr/bin/armv7-alpine-linux-musleabihf-gcc
           # The musl builder resolves armv7-alpine-linux-musleabihf-* siblings
           # beside the compiler it is given; those copies live in usr/bin.

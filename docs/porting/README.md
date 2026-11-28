@@ -355,7 +355,9 @@ Then add the target to:
 | `release/target.schema.json` | the new `target_id`, `release_slug`, fastboot product and `hw_profile` enums, plus an `allOf` identity block like the `biscuit` one |
 | `build/ci/target_registry.py` | `KNOWN_TARGETS` and the expected `(slug, products, hw_profile)` identity |
 | `build/ci/validate-targets.py`, `build/build.sh` | the default and usage target lists |
+| `tools/prepare-release.py`, `tools/check-release-components.py` | the new id in each `--target` choice list (`lidar` also turns on the MTK boot-chain signature rules) |
 | `.github/workflows/build-release.yml`, `.github/workflows/publish-release.yml` | the `targets` input description and the target choice list |
+| `.github/workflows/release-gate.yml` | the target list in the `target-contracts` job's descriptor loop |
 | `release/amonet-pins.json` | the model's community amonet archive: name, size, SHA-256 and each reviewed LK build's payload |
 | `tools/libreecho-install.py` | `AMONET_PINS` (kept equal to `amonet-pins.json` by tests), `USERDATA_TARGET_BYTES`, `ADB_DEVICE_PROP`, `TARGET_INDEX`; then regenerate `tools/libreecho-install.py.sha256` |
 | `tools/run-one-shot.sh` | the board, recovery and fastboot product matches, and the slug |
@@ -380,9 +382,15 @@ after that.
 Product host checks:
 
 ```sh
-python3 build/ci/validate-targets.py --targets radar_puffin,biscuit,<target_id>
+python3 build/ci/validate-targets.py --targets radar_puffin,biscuit
+python3 build/ci/validate-targets.py --targets <target_id>
 python3 -B -m unittest tools.test_initial_installer_publication tools.test_fastbrick_gate
 ```
+
+One build run compiles a single kernel, so a dispatch target list must share
+arch, defconfig and DTB; `validate-targets.py` refuses a set that differs and
+names the conflicting targets and fields. A target with a different kernel
+gets its own run.
 
 The full set of maintained Product suites is listed in the `Run maintained
 Product pipeline suites` step of `build-release.yml`. They need PyNaCl and a

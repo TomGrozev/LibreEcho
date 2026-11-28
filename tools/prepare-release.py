@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -18,6 +19,96 @@ EMPTY_DIFF_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b785
 REPO = re.compile(r"^https://github\.com/[^/]+/[^/]+$")
 RUN_ID = re.compile(r"(?:^|[-_])20\d{6}T\d{6}Z(?:[-_]|$)")
 PRIVATE_SERIAL_DEVICE = re.compile(r"/dev/tty(?:ACM|USB|S)[0-9]+(?:\b|$)")
+
+# Donor-derived Lidar material never reaches a public release: proprietary
+# donor-derived artifacts are generated locally from the owner's own dump and
+# are never distributed.
+# Radar and Biscuit releases legitimately ship MTK-headed boot images, so the
+# MTK and eMMC boot signatures are only checked for a Lidar target.  Radio
+# firmware rules stay target-independent and live in radio_firmware.py only.
+DONOR_MANIFEST_SCHEMA = "libreecho-lidar-donor-artifacts-v1"
+LIDAR_MTK_SIGNATURES = (
+    ("MTK preloader/LK/TEE header", b"\x88\x16\x88\x58"),
+    ("eMMC boot preloader", b"EMMC_BOOT"),
+)
+
+
+def _load_radio_firmware():
+    path = Path(__file__).resolve().with_name("radio_firmware.py")
+    spec = importlib.util.spec_from_file_location("radio_firmware", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit("ERROR: radio firmware validator is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_donor_manifest(path: Path | None) -> dict[str, str]:
+    """Return ``sha256 -> name`` from a generator manifest, or an empty map."""
+    if path is None:
+        return {}
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"ERROR: donor artifact manifest is unavailable: {path}")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"ERROR: donor artifact manifest is not JSON: {error}")
+    if (not isinstance(data, dict) or
+            data.get("schema") != DONOR_MANIFEST_SCHEMA or
+            not isinstance(data.get("artifacts"), list)):
+        raise SystemExit("ERROR: donor artifact manifest is malformed")
+    digests: dict[str, str] = {}
+    for record in data["artifacts"]:
+        digest = record.get("sha256") if isinstance(record, dict) else None
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise SystemExit("ERROR: donor artifact manifest has an invalid digest")
+        digests[digest] = record.get("name", "<unnamed>")
+    return digests
+
+
+def reject_donor_derived_artifacts(
+    paths, donor_manifest: Path | None = None, *,
+    digests: dict[str, str] | None = None, lidar_target: bool = False,
+) -> None:
+    """Refuse any release asset that carries donor-derived boot-chain bytes.
+
+    GBL and EFR32 radio firmware rules come from ``radio_firmware.py``.  The
+    MTK preloader/LK/TEE and eMMC boot headers are checked only for a Lidar
+    target, because Radar and Biscuit releases ship those headers by design.
+    Digests from the Lidar generator manifest are always refused.
+    ``paths`` may name directories, which are walked for regular files.
+    ``digests`` may supply already-computed sha256 values keyed by ``str(path)``
+    so a caller does not hash an artifact twice.
+    """
+    radio = _load_radio_firmware()
+    artifacts = list(radio.iter_files(paths))
+    radio_findings = radio.check(artifacts)
+    if radio_findings:
+        raise SystemExit("ERROR: " + "; ".join(radio_findings))
+    donor_digests = load_donor_manifest(donor_manifest)
+    for path in artifacts:
+        if lidar_target:
+            try:
+                with path.open("rb") as stream:
+                    head = stream.read(16)
+            except OSError as error:
+                raise SystemExit(
+                    f"ERROR: cannot inspect release artifact {path}: {error}")
+            for label, magic in LIDAR_MTK_SIGNATURES:
+                if head[:len(magic)] == magic:
+                    raise SystemExit(
+                        f"ERROR: donor-derived {label} signature in {path.name}; "
+                        "do not publish a boot-chain image")
+        if not donor_digests:
+            continue
+        digest = (digests or {}).get(str(path))
+        if digest is None:
+            digest = sha256(path)
+        if digest in donor_digests:
+            raise SystemExit(
+                f"ERROR: {path.name} matches donor artifact "
+                f"{donor_digests[digest]!r} in the generator manifest; "
+                "do not publish it")
 
 
 def sha256(path: Path) -> str:
@@ -182,6 +273,12 @@ def main() -> None:
         default="commercially-unrestricted",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--target", choices=("radar_puffin", "biscuit", "lidar"),
+        help="release target id; lidar enables the MTK boot-chain signature rules")
+    parser.add_argument(
+        "--donor-manifest", type=Path,
+        help="Lidar donor artifact generator manifest; its digests are refused")
     args = parser.parse_args()
 
     if not RELEASE_ID.fullmatch(args.release_id):
@@ -217,6 +314,11 @@ def main() -> None:
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     records = [{"name": p.name, "sha256": sha256(p), "size": p.stat().st_size} for p in args.artifact]
+    reject_donor_derived_artifacts(
+        args.artifact, args.donor_manifest,
+        digests={str(record_path): record["sha256"]
+                 for record_path, record in zip(args.artifact, records)},
+        lidar_target=(args.target == "lidar" or args.donor_manifest is not None))
     provenance = {
         "schema_version": 1,
         "release_id": args.release_id,
