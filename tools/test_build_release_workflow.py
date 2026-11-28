@@ -264,8 +264,15 @@ class Tests(unittest.TestCase):
   # The glibc dev linker scripts bake absolute /usr/arm-linux-gnueabihf
   # paths; anchor the staged closure there so configure link probes work.
   self.assertIn('Anchor ARMHF sysroot at its packaged absolute paths', W)
-  self.assertIn('sudo ln -sfT "$RUNNER_TEMP/armhf-root/usr/arm-linux-gnueabihf" /usr/arm-linux-gnueabihf', W)
+  self.assertIn('sudo build/ci/provision-host.sh --anchor "$RUNNER_TEMP/armhf-root"', W)
   self.assertIn('armhf-anchor-probe', W)
+  provision = (ROOT/'build/ci/provision-host.sh').read_text()
+  self.assertIn('ln -sfT "$root/usr/arm-linux-gnueabihf" /usr/arm-linux-gnueabihf', provision)
+  self.assertIn('ln -sfT "$root/usr/lib/gcc-cross/arm-linux-gnueabihf"', provision)
+  # The hosted lane verifies the same host contract the container image
+  # installs, so runner drift fails before the build instead of inside it.
+  self.assertIn('sudo build/ci/provision-host.sh --install --check', W)
+  self.assertIn('install ok installed', provision)
   # Autotools cross builds (wakeword SpeexDSP configure) discover the
   # compiler from PATH; the shim exposes only prefixed cross tools so the
   # host binutils are never shadowed.

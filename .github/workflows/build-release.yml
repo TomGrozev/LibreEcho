@@ -680,6 +680,13 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.11'
+      - name: Provision the build host baseline
+        run: |
+          set -euo pipefail
+          # The runner image already carries this baseline, so the install is
+          # a no-op here; the same script builds the pinned container image,
+          # which keeps one definition of the host both lanes build on.
+          sudo build/ci/provision-host.sh --install --check
       - name: Install reviewed OTA signing dependency closure
         run: |
           set -euo pipefail
@@ -1179,10 +1186,7 @@ jobs:
             echo "ERROR: staged ARMHF sysroot is missing: $RUNNER_TEMP/armhf-root" >&2
             exit 1
           }
-          sudo ln -sfT "$RUNNER_TEMP/armhf-root/usr/arm-linux-gnueabihf" /usr/arm-linux-gnueabihf
-          sudo mkdir -p /usr/lib/gcc-cross
-          sudo ln -sfT "$RUNNER_TEMP/armhf-root/usr/lib/gcc-cross/arm-linux-gnueabihf" \
-            /usr/lib/gcc-cross/arm-linux-gnueabihf
+          sudo build/ci/provision-host.sh --anchor "$RUNNER_TEMP/armhf-root"
           # Fail closed here, not mid-wakeword-build: a dynamic link probe
           # exercises the GROUP scripts through the anchored paths.
           printf 'int main(void){return 0;}\n' > /tmp/armhf-anchor-probe.c

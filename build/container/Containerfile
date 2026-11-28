@@ -1,0 +1,102 @@
+# Reproducible LibreEcho build host.
+#
+# This is the ubuntu-24.04 GitHub Actions runner the hosted build uses, pinned
+# by digest, with its package archive frozen at a snapshot date. Every
+# compiler, sysroot, source archive and wheel the build consumes is still
+# staged from the committed locks at build time; this image only provides the
+# host baseline that the runner image used to supply implicitly.
+#
+# The architecture is amd64 only. The ARMHF (ports.ubuntu.com) packages the
+# AirPlay sysroot downloads are fetched live by the build job itself, exactly
+# as they are on a hosted runner; snapshot.ubuntu.com does not serve ports.
+
+FROM docker.io/library/ubuntu:24.04@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a
+
+# Fixes the archive state. snapshot.ubuntu.com resolves any timestamp to the
+# last published snapshot at or before it. It must be later than the base
+# image's publish date (2026-11-10T18:35Z): the image already carries those
+# versions and apt will not downgrade one to satisfy a dependency, so on the
+# publish day itself the snapshot predates the image and perl-base
+# 5.38.2-3.2ubuntu0.6 conflicts with the image's 0.7.
+ARG UBUNTU_SNAPSHOT=20261115T000000Z
+
+# Noble ships CPython 3.12, but the reviewed mbedTLS wheel closure is cp311 and
+# the workflow pins 3.11 through actions/setup-python. Install the same 3.11
+# from a hash-pinned python-build-standalone release so the container and the
+# hosted runner build the UI with the same interpreter.
+ARG PYTHON_STANDALONE_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20261124/cpython-3.11.18%2B20261124-x86_64-unknown-linux-gnu-install_only.tar.gz
+ARG PYTHON_STANDALONE_SHA256=ef0764e884b5e123692281b91bf388f8ebfd0afb41d6a212bb4f2779e51abf0e
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8
+
+LABEL org.opencontainers.image.title="libreecho-build" \
+      org.opencontainers.image.description="Pinned LibreEcho build host (ubuntu 24.04 runner baseline)" \
+      org.opencontainers.image.base.digest="sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a"
+
+# The image has no CA bundle, and apt needs one before it can use the https
+# snapshot URL. Take ca-certificates from the live archive: it is the trust
+# anchor for everything below, not a build input (the build vendors its own
+# reviewed CA bundle).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Freeze the amd64 archive. The base image lists archive.ubuntu.com and
+# security.ubuntu.com; point both pockets at the snapshot. universe,
+# multiverse and backports are dropped from every stanza: every baseline
+# package lives in main/restricted, and their indexes are two thirds of the
+# 34 MB an update downloads from a single un-mirrored server.
+RUN set -eu; \
+    for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do \
+      [ -f "$f" ] || continue; \
+      sed -i -E \
+        -e "s#http://(archive|security)\.ubuntu\.com/ubuntu/?#https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/#g" \
+        -e 's/ universe//g' -e 's/ multiverse//g' -e 's/ noble-backports//g' \
+        "$f"; \
+    done; \
+    grep -q "snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/" /etc/apt/sources.list.d/ubuntu.sources
+
+# The snapshot host is a single best-effort origin that has served 503s during
+# outages, so retry the fetches instead of failing the image build once.
+RUN printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-retries
+
+# The single host definition shared with the GitHub workflow.
+COPY build/ci/provision-host.sh /usr/local/bin/provision-host.sh
+RUN /usr/local/bin/provision-host.sh --install
+
+# curl is now available from the snapshot.
+RUN set -eu; \
+    curl -fsSL --retry 5 --retry-all-errors -o /tmp/python.tar.gz "$PYTHON_STANDALONE_URL"; \
+    printf '%s  %s\n' "$PYTHON_STANDALONE_SHA256" /tmp/python.tar.gz | sha256sum -c -; \
+    mkdir -p /opt/python; \
+    tar -xzf /tmp/python.tar.gz -C /opt/python --strip-components=1; \
+    rm -f /tmp/python.tar.gz; \
+    ln -sf /opt/python/bin/python3.11 /usr/local/bin/python3; \
+    ln -sf python3 /usr/local/bin/python; \
+    ln -sf /opt/python/bin/pip3 /usr/local/bin/pip3; \
+    ln -sf pip3 /usr/local/bin/pip; \
+    python3 -V; pip --version
+
+RUN /usr/local/bin/provision-host.sh --check \
+ && rm -rf /var/lib/apt/lists/*
+
+# What the image actually resolved, so a rebuild can be diffed against it
+# instead of trusted. Refreshing UBUNTU_SNAPSHOT is the only intended change.
+RUN mkdir -p /usr/local/share/libreecho \
+ && dpkg-query -W -f='${Package}\t${Version}\n' > /usr/local/share/libreecho/host-packages.txt
+
+# Rootless podman with --userns=keep-id maps the invoking user to the same
+# UID inside, so a build user matching the usual desktop UID keeps the mounted
+# work tree writable without ownership fixups. The base image already owns
+# UID 1000 as "ubuntu", so that account is replaced. sudo exists only for the
+# ARMHF sysroot anchor, which writes two absolute paths outside the work tree.
+ARG BUILD_UID=1000
+RUN set -eu; \
+    if id ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi; \
+    useradd --create-home --uid "$BUILD_UID" --shell /bin/bash builder; \
+    printf 'builder ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/builder; \
+    chmod 0440 /etc/sudoers.d/builder
+
+USER builder
+WORKDIR /home/builder
