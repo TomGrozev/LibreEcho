@@ -34,6 +34,12 @@ archive's default `fastbrick.img`. If the device reports no LK build (an empty
 `lk_build_desc`), the installer stops before any write. The Echo 2nd Gen
 accepts only the builds listed in its row.
 
+> **Echo Plus 2nd Gen (`lidar`) is not covered by this guide.** It has no
+> Amonet payload, no published release and no upstream support. The port boots
+> on hardware only from lab builds; its separate lab path (boot-chain
+> preparation with `lidar_prepare.py`, then `--target lidar`) is in
+> [lidar.md](lidar.md).
+
 ## Equipment
 
 ### Required
