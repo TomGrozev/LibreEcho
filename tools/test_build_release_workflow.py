@@ -844,6 +844,12 @@ class SshInputInventoryTests(unittest.TestCase):
   self.assertIn('--scp "$DROPBEAR_OUTPUT/scp"',block)
   # The image has root login disabled, so no root password argument exists.
   self.assertNotIn('--ssh-root-password-hash',B)
+  # Both arch paths hand the same bundle to their image builder.
+  arm32_build=B.split('=== packaging canonical ARM32 recovery image ===',1)[1].split('\nelse\n',1)[0]
+  arm64_build=B.split('=== packaging canonical ARM64 Lidar recovery image ===',1)[1].split('\n\nbootsha=',1)[0]
+  for name,branch in (('arm32',arm32_build),('arm64',arm64_build)):
+   with self.subTest(path=name):
+    self.assertIn('"${ssh_builder_args[@]}"',branch)
 
  def test_ssh_verifier_expects_all_three_binaries(self):
   block=B.split('ssh_verifier_args=(\n',1)[1].split('\nfi',1)[0]
@@ -851,6 +857,11 @@ class SshInputInventoryTests(unittest.TestCase):
   self.assertIn('--expected-dropbearkey-sha256',block)
   self.assertIn('--expected-scp-sha256',block)
   self.assertIn('-f "$DROPBEAR_OUTPUT/scp"',B)
+  # Both arch paths pin the same three hashes in the independent verifier.
+  verify=B.split('=== independent image verification ===',1)[1]
+  arm64_verify=verify.split('\nelse\n',1)[1]
+  self.assertIn('"${ssh_verifier_args[@]}"',verify)
+  self.assertIn('"${ssh_verifier_args[@]}"',arm64_verify)
 
  def test_documentation_denies_root_login(self):
   flat=' '.join((ROOT/'build/README.md').read_text().split())

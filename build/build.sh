@@ -2517,7 +2517,10 @@ python3 -B "$BUILDER" "${TARGET_TOOL_ARGS[@]}" \
 else
   echo "=== packaging canonical ARM64 Lidar recovery image ==="
   # The MT8167 builder builds the MediaTek envelope, appends the 19 stock DTBs
-  # and rejects every MT8163-only payload flag, so none is passed.
+  # and rejects every MT8163-only payload flag, so none is passed.  The SSH
+  # bundle is not one of those: Lidar's userspace is the shared ARM32 tree, so
+  # the same opt-in dropbear/strict-scp bundle that the MT8163 image carries
+  # applies here unchanged.
   BOOT_ENVELOPE=
   platform_args "$BUILDER" --descriptor "$TARGET_DESCRIPTOR_SHA256"
   python3 -B "$BUILDER" "${TARGET_TOOL_ARGS[@]}" \
@@ -2539,6 +2542,7 @@ else
     --ui-bundle "$UI_BUNDLE" --ui-source "$UI_SOURCE" \
     --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
     --mdns-runtime "$MDNS_RUNTIME_ROOT" \
+    "${ssh_builder_args[@]}" \
     --output "$RUN/boot.img" \
     --ramdisk-output "$RUN/boot.ramdisk.cpio.xz" \
     --manifest "$RUN/manifest.json" | tee "$RUN/build.log"
@@ -2604,6 +2608,7 @@ else
     --expected-ota-public-key-sha256 "$ota_public_key_sha" \
     --expected-ui-manifest-sha256 "$ui_manifest_sha" \
     --expected-ui-commit "$ui_commit" --expected-ui-diff-sha256 "$ui_diff_sha" \
+    "${ssh_verifier_args[@]}" \
     | tee "$RUN/verify.log"
 fi
 
