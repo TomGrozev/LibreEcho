@@ -95,7 +95,7 @@ output is copied into this repository or attached to a release:
 
 ```sh
 python3 tools/prepare-release.py \
-  --candidate /private/run/CURRENT.candidate \
+  --candidate /srv/build/CURRENT.candidate \
   --artifact ota.tar \
   --artifact initial-install.tar \
   --release-id radar-puffin-vX.Y.Z \
